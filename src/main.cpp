@@ -5,40 +5,39 @@
  * ─────────────────────────────────────
  *  Two shared slots (back / front) replace the old 4-independent-buffer scheme.
  *
- *  Memory layout (QOI, updated):
+ *  Memory layout (QOI + full-frame):
  *    slot[0].assembly  SRAM  40 KB  ─┐ sequential QOI stream read → must be fast
  *    slot[1].assembly  SRAM  40 KB  ─┘
- *    slot[0].fb        PSRAM 38 KB  ─┐ DMA source; QOI decoder writes DIRECTLY here
- *    slot[1].fb        PSRAM 38 KB  ─┘   (no SRAM scratch needed — sequential writes)
- *    chunkStorage[4]   PSRAM 160 KB   chunk staging; network writes, not decode-critical
- *
- *  vs JPEG layout (previous):
- *    Removed: decodeTemp  SRAM  38 KB  (JPEGDEC MCU scatter-write scratch)
- *    SRAM saved: ~23 KB  (105 KB → 80 KB for decode pipeline)
+ *    decodeTemp        SRAM  38 KB    Core-1 QOI tile scratch; row-stride copied to frameFb
+ *    frameFb[0]        PSRAM 150 KB ─┐ full 320×240 frame; DMA source ONLY
+ *    frameFb[1]        PSRAM 150 KB ─┘ double-buffered; display pushes one atomic frame
+ *    chunkStorage[4]   PSRAM 168 KB   chunk staging; network writes, not decode-critical
  *
  *  QOI decode pipeline (Core 1):
- *    qoi_to_rgb565be(slot[s].assembly → tileFb[writeSet][tId])
- *      • Reads SRAM sequentially (L1 hot, forward-only)
- *      • Writes PSRAM sequentially (cache-line streaming, 2-pixel 32-bit coalescing on runs)
- *      • Inline RGB888 → RGB565 + bswap16 — zero extra pass
+ *    qoi_to_rgb565be(slot[s].assembly → decodeTemp, srcW, srcH)  [SRAM, sequential]
+ *    row-stride memcpy(decodeTemp → frameFb[writeSet] at tile XY, SCREEN_W stride)
+ *      • QOI reads SRAM forward-sequentially (L1 hot)
+ *      • Tile pixels land in decodeTemp (SRAM) first — sequential write, fast
+ *      • Row-stride memcpy coalesces to 32-byte PSRAM cache lines
+ *      • Single lcd.pushImage(0,0,320,240) per frame — no tile-seam artifacts
+ *      • Inline RGB888 → RGB565 BE — zero extra bswap pass
  *      • 64-entry hash table (256 B) stays in L1 permanently
- *      • No MCU callbacks, no scatter-writes, no extra memcpy
  *
  *  Pipeline (steady state):
  *
- *    Core 0 (net)      Core 1 (render)
- *    ─────────────     ───────────────
+ *    Core 0 (net)                    Core 1 (render)
+ *    ─────────────                   ───────────────
  *    assemble → slot[back].assembly (SRAM)
- *    post decodeQueue ──────────────→ take decodeQueue
- *    back ^= 1                        qoi_to_rgb565be → tileFb[writeSet][tId] (PSRAM direct)
- *    take slotFree[back]              when readyMask==0x0F: post DisplayMsg
- *    assemble → slot[back].assembly   give slotFree[s]
- *    post decodeQueue  ←────────────
+ *    post decodeQueue ───────────────→ take decodeQueue
+ *    back ^= 1                         qoi_to_rgb565be → decodeTemp (SRAM)
+ *    take slotFree[back]               row-stride memcpy → frameFb[writeSet] at tile XY
+ *    assemble → slot[back].assembly    when readyMask==0x0F: post DisplayMsg → displayQueue
+ *    post decodeQueue ←──────────────  give slotFree[s]
  *    ...
  *
  *  Stats packet (0xAB 0xCD prefix, sent every second when debugEnabled):
  *    FPS:X.X|TEMP:XX.X|JIT:X.X|DEC:XXXX|DROP:X|ABRT:X|SRAM:XXXX/XXXX|PSRAM:XXXX/XXXX
- *    DEC  = avg tile QOI decode µs (inline to PSRAM, NOT pushImage)
+ *    DEC  = avg tile QOI decode+copy µs (SRAM decode + row-stride memcpy, NOT pushImage)
  *    DROP = corrupt + timeout count in this 1-second window
  *    ABRT = partial frames discarded due to frameId switch (UDP reorder/overrun)
  *    SRAM/PSRAM = free_KB/total_KB
@@ -70,7 +69,7 @@ class LGFX : public lgfx::LGFX_Device {
     lgfx::Panel_ILI9341  _panel;
 public:
     LGFX() {
-        { auto cfg=_bus.config(); cfg.freq_write=20000000;
+        { auto cfg=_bus.config(); cfg.freq_write=30000000;
           cfg.pin_wr=1; cfg.pin_rd=40; cfg.pin_rs=2;
           cfg.pin_d0=5; cfg.pin_d1=4;  cfg.pin_d2=10;
           cfg.pin_d3=9; cfg.pin_d4=3;  cfg.pin_d5=8;
@@ -127,32 +126,22 @@ static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 // ─────────────────────────────────────────────
 //  PIPELINE SLOTS  (2 shared decode/display buffers)
 //  assembly is in SRAM — QOI decoder reads forward-sequentially: L1 hot.
-//  No fb field here: decode goes DIRECTLY to tileFb[writeSet][tId] in PSRAM.
+//  Decoded pixels go to decodeTemp (SRAM) first, then row-stride copied into frameFb.
 // ─────────────────────────────────────────────
 struct PipeSlot {
     uint8_t*  assembly;   // SRAM — QOI stream; forward-sequential read during decode
 };
 static PipeSlot slot[2];
 
-// Double-buffered per-tile framebuffers in PSRAM.
-// QOI decoder writes DIRECTLY here (sequential, cache-line friendly).
-// tileFb[0] and tileFb[1] are two complete sets of 4 tile buffers.
-// Core 1 (decoder) writes into tileFb[writeSet][tId].
-// Display task reads from tileFb[displaySet][tId].
-static uint16_t* tileFb[2][NUM_TILES] = {
-    { nullptr, nullptr, nullptr, nullptr },
-    { nullptr, nullptr, nullptr, nullptr }
-};
-static uint8_t writeSet = 0;   // Core 1 exclusive — no sync needed
-
-// Per-tile encoded dimensions for current write set.
-// Core 1 writes before posting DisplayMsg; displayTask reads them.
-// 0 means full-size (TILE_W x TILE_H) — pushImage uses TILE_W/TILE_H directly.
-struct TileMeta {
-    uint8_t encW;   // encoded width  (0 = TILE_W)
-    uint8_t encH;   // encoded height (0 = TILE_H)
-};
-static TileMeta tileMeta[2][NUM_TILES] = {};   // [bufSet][tileIdx]
+// Double-buffered full-frame framebuffers in PSRAM (320×240×2 = 150 KB each).
+// Core 1 (decoder) row-stride copies each decoded tile into the correct XY region of
+// frameFb[writeSet] so the full frame is always contiguous in memory.
+// displayTask pushes one atomic lcd.pushImage(0,0,320,240) per frame,
+// eliminating per-tile seam artifacts that appear at high FPS.
+// writeSet is flipped after posting to displayQueue; both halves are
+// never accessed simultaneously.
+static uint16_t* frameFb[2] = { nullptr, nullptr };
+static uint8_t writeSet = 0;  // Core 1 exclusive — no sync needed
 
 // Message passed through the decode queue
 struct DecodeMsg {
@@ -169,15 +158,12 @@ static QueueHandle_t     decodeQueue;    // depth-1 queue: net → renderer
 static SemaphoreHandle_t slotFree[2];   // given when renderer finishes slot
 
 // Display pipeline: Core 1 posts here when all 4 tiles are ready.
+// Display task (separate) does the blocking pushImage call.
 struct DisplayMsg {
     uint8_t frameId;   // for stats / debug
-    uint8_t bufSet;    // which tileFb[bufSet] to push (0 or 1)
+    uint8_t bufSet;    // which frameFb[bufSet] to push (0 or 1)
 };
-static QueueHandle_t     displayQueue;          // depth-1 queue: renderer → display task
-static SemaphoreHandle_t bufFree[2];            // render takes before 1st tile, display gives after push
-// ↑ Prevents the render task from writing into a tileFb buffer that
-//   displayTask is still reading (guards against writeSet cycling back
-//   to the same index before the previous display pass has finished).
+static QueueHandle_t     displayQueue;          // depth-2 queue: renderer → display task (Core 0)
 
 // ─────────────────────────────────────────────
 //  CHUNK REASSEMBLY STATE  (one per tile position)
@@ -277,7 +263,7 @@ static IRAM_ATTR int assembleTileInto(uint8_t t, uint8_t* dst) {
 //    New (LUT + memcpy burst):         ~0.25 ms
 //
 //  src : SRAM decodeTemp  (srcW × srcH × 2 B, 16-byte aligned)
-//  dst : PSRAM tileFb     (TILE_W × TILE_H × 2 B, 16-byte aligned)
+//  dst : PSRAM frameFb at tile XY  (dstStride = SCREEN_W pixels)
 
 // Persistent LUT — rebuilt only when srcW or srcH changes (rare).
 static uint16_t DRAM_ATTR s_xMap[TILE_W];   // xMap[dstX] = srcX
@@ -289,7 +275,8 @@ static int      s_lutSrcH = -1;
 static IRAM_ATTR void upscaleNN(
         const uint16_t* __restrict__ src,
         uint16_t*       __restrict__ dst,
-        int srcW, int srcH)
+        int srcW, int srcH,
+        int dstStride)   // row stride of dst in pixels (SCREEN_W when writing into frameFb)
 {
     // ── Rebuild LUT only when dimensions change ────────────────────────────
     // This is a one-time cost per mode switch, not per tile.
@@ -333,7 +320,8 @@ static IRAM_ATTR void upscaleNN(
         // Sequential PSRAM write: cache-line precharger fires on every 32-byte
         // boundary.  memcpy picks EE.LQ/EE.SQ (128-bit) automatically when
         // both pointers are 16-byte aligned (guaranteed by heap_caps_aligned_alloc).
-        memcpy(dst + dy * TILE_W, s_lineBuf, TILE_W * sizeof(uint16_t));
+        // dstStride=SCREEN_W places each row at the correct X offset in frameFb.
+        memcpy(dst + dy * dstStride, s_lineBuf, TILE_W * sizeof(uint16_t));
     }
 }
 
@@ -341,23 +329,28 @@ static IRAM_ATTR void upscaleNN(
 //  QOI DECODE PIPELINE  (Core 1 — single function call)
 // ─────────────────────────────────────────────
 //
-//  qoi_to_rgb565be() (qoi_dec.h):
-//    • src: slot[s].assembly  (SRAM, sequential read, L1 hot)
-//    • dst: tileFb[writeSet][tId]  (PSRAM, sequential write, cache-line streaming)
-//    • Inline RGB888→RGB565 BE: no extra pass, no bswap16 function needed
-//    • Run fills use 32-bit stores: 2 pixels/store coalesces to 32-byte PSRAM lines
-//    • 64-entry hash idx[256 B] stays hot in L1 — never touches PSRAM
+//  Step 1 — qoi_to_rgb565be() decodes QOI stream from slot[s].assembly (SRAM)
+//            into decodeTemp (SRAM, TILE_W×TILE_H or srcW×srcH for upscale).
+//            SRAM destination keeps all decode writes in L1 cache.
+//
+//  Step 2 — row-stride memcpy copies each row of decodeTemp into the correct
+//            XY region of frameFb[writeSet] (PSRAM, stride = SCREEN_W).
+//            TILE_W = 160 = 5×32 → no tail per row; 32-byte PSRAM cache lines
+//            are always fully filled.
+//
+//  Step 3 — lcd.pushImage(0,0,320,240) sends the full frameFb atomically.
+//            No per-tile seam possible — display receives one continuous stream.
 //
 //  Compared to JPEG pipeline:
-//    JPEG: openRAM → mcuCallback scatter-writes (1200× random) → bswap16_simd → memcpy
-//    QOI:  qoi_to_rgb565be (one sequential pass, direct to PSRAM)
+//    JPEG: openRAM → mcuCallback scatter-writes (1200× random) → bswap16_simd → row-stride memcpy
+//    QOI:  qoi_to_rgb565be → decodeTemp (SRAM) → row-stride memcpy (no bswap needed, already BE)
 //
 //  Returns true on success. Caller must give slotFree[slotIdx] regardless.
 
 static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     PipeSlot& s = slot[msg.slotIdx];
 
-    if (msg.tId >= NUM_TILES || tileFb[writeSet][msg.tId] == nullptr) {
+    if (msg.tId >= NUM_TILES || frameFb[writeSet] == nullptr) {
         decodeUs = 0;
         return false;
     }
@@ -367,33 +360,46 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     int srcH = (msg.encH > 0) ? (int)msg.encH : TILE_H;
     int srcPixels = srcW * srcH;
 
-    // For upscaled tiles (srcW < TILE_W) we decode into decodeTemp (SRAM) first,
-    // then pushImage with src dims — LovyanGFX stretches to TILE_W x TILE_H.
-    // For full-size tiles, decode directly into tileFb PSRAM (no extra buffer).
-    //
-    // decodeTemp is re-used here from the QOI era: we re-allocate it in setup()
-    // only when upscale is detected (srcW < TILE_W). For full-size frames it
-    // remains unused and the pointer stays null, so we check before using it.
+    // frameFb destination: tile XY offset into full 320-wide frame
+    uint16_t* fbBase = frameFb[writeSet]
+                     + TILE_Y[msg.tId] * SCREEN_W
+                     + TILE_X[msg.tId];
 
     uint32_t t0 = micros();
 
     if (srcW == TILE_W && srcH == TILE_H) {
-        // Full-size: decode directly to PSRAM framebuffer (sequential, fast)
+        // ── Full-size: decode QOI into SRAM scratch, then row-stride copy → frameFb ──
+        // decodeTemp is Core-1 exclusive — no sync needed.
+        // Decoding to SRAM keeps all QOI hash/index writes in L1 cache.
+        // Row-stride memcpy below fills 32-byte PSRAM cache lines cleanly
+        // (TILE_W=160 → 320 B/row = 10 cache lines, always aligned).
+        if (decodeTemp == nullptr) {
+            Serial.printf("[DEC] slot%u decodeTemp null\n", msg.slotIdx);
+            decodeUs = 0;
+            return false;
+        }
         int rc = qoi_to_rgb565be(s.assembly, (int)msg.len,
-                                 tileFb[writeSet][msg.tId],
-                                 srcW, srcH);
-        decodeUs = micros() - t0;
+                                 decodeTemp, srcW, srcH);
         if (rc != srcPixels) {
             Serial.printf("[DEC] slot%u QOI err: expected %d px got %d (len=%u)\n",
                           msg.slotIdx, srcPixels, rc, msg.len);
             decodeUs = 0;
             return false;
         }
+        // Row-stride copy: each tile row (TILE_W pixels = 320 B) placed at
+        // the correct XY offset within the 320-wide frameFb.
+        for (int row = 0; row < TILE_H; row++)
+            memcpy(fbBase + row * SCREEN_W,
+                   decodeTemp + row * TILE_W,
+                   TILE_W * sizeof(uint16_t));
+
+        decodeUs = micros() - t0;
     } else {
         // Upscale path:
         //   1. QOI → decodeTemp (SRAM, srcW×srcH)  — sequential SRAM write, fast
-        //   2. upscaleNN(decodeTemp → tileFb PSRAM) — 128-bit burst memcpy rows
-        // tileFb ends up full TILE_W×TILE_H so displayTask uses normal pushImage.
+        //   2. upscaleNN(decodeTemp → frameFb at tile XY, dstStride=SCREEN_W)
+        // frameFb ends up with the full TILE_W×TILE_H tile in place so
+        // displayTask's single pushImage covers it atomically.
         if (decodeTemp == nullptr) {
             Serial.printf("[DEC] decodeTemp null but upscale srcW=%d srcH=%d\n", srcW, srcH);
             decodeUs = 0;
@@ -408,21 +414,13 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
             decodeUs = 0;
             return false;
         }
-        // Nearest-neighbour upscale: SRAM decodeTemp → PSRAM tileFb (full size).
-        // esp_task_wdt_reset() before and after: upscaleNN does 120 memcpy() calls
-        // into PSRAM which can take ~0.3 ms — enough to trip the TWDT if loop()
-        // is already close to its deadline.  Reset keeps the watchdog fed.
+        // Nearest-neighbour upscale: SRAM decodeTemp → PSRAM frameFb at tile XY.
+        // dstStride=SCREEN_W so each upscaled row lands at the correct X offset.
         esp_task_wdt_reset();
-        upscaleNN(decodeTemp, tileFb[writeSet][msg.tId], srcW, srcH);
+        upscaleNN(decodeTemp, fbBase, srcW, srcH, SCREEN_W);
         esp_task_wdt_reset();
         decodeUs = micros() - t0;
     }
-
-    // tileFb is always TILE_W×TILE_H after this point:
-    // full-size tiles decoded directly; upscaled tiles expanded by upscaleNN above.
-    // Store 0/0 so displayTask always takes the fast pushImage path.
-    tileMeta[writeSet][msg.tId].encW = 0;
-    tileMeta[writeSet][msg.tId].encH = 0;
 
     return true;
 }
@@ -629,30 +627,22 @@ static void drawBootHeader() {
     lcd.setTextColor(TFT_CYAN, 0x1082); lcd.setTextSize(2);
     lcd.drawString("ESP32-S3 QOI STR", 8, 6);
     lcd.setTextSize(1); lcd.setTextColor(0x7BEF, 0x1082);
-    lcd.drawString("ILI9341  320x240  QOI pipeline", 8, 34);
+    lcd.drawString("ILI9341  320x240  QOI full-frame", 8, 34);
     lcd.drawFastHLine(0, 54, SCREEN_W, TFT_DARKGREY);
 }
 
 // ─────────────────────────────────────────────
 //  DISPLAY TASK  (Core 0, priority 2)
 // ─────────────────────────────────────────────
-// tileFb[bufSet][t] is always TILE_W×TILE_H by the time we get here
-// (full-size decoded directly; upscaled tiles expanded by upscaleNN in decodeSlot).
-// After pushing all 4 tiles, gives bufFree[bufSet] so the render task can
-// reuse this buffer for the next frame N+2.
+// Pinned to Core 0 alongside networkTask (priority 3).
+// networkTask always preempts displayTask on UDP packet arrival.
+// depth-2 displayQueue means Core 1 never blocks even if Core 0 is mid-push.
+// Single pushImage covers the full 320×240 frame atomically — no tile seam.
 static void displayTask(void*) {
     DisplayMsg dmsg;
     while (true) {
         if (xQueueReceive(displayQueue, &dmsg, portMAX_DELAY) != pdTRUE) continue;
-
-        for (int t = 0; t < NUM_TILES; t++) {
-            lcd.pushImage(TILE_X[t], TILE_Y[t], TILE_W, TILE_H,
-                          tileFb[dmsg.bufSet][t]);
-        }
-
-        // All 4 tiles pushed — release exclusive ownership of this buffer back
-        // to the render task.  The render task may have been blocking on this.
-        xSemaphoreGive(bufFree[dmsg.bufSet]);
+        lcd.pushImage(0, 0, SCREEN_W, SCREEN_H, frameFb[dmsg.bufSet]);
         g_presentedFrames++;
     }
 }
@@ -664,7 +654,7 @@ void setup() {
     Serial.begin(115200);
     uint32_t t0 = millis();
     while (!Serial && (millis() - t0) < 2000) delay(10);
-    Serial.println("\n[BOOT] QOI pipeline — direct PSRAM decode, no SRAM scratch");
+    Serial.println("\n[BOOT] QOI pipeline — SRAM decode scratch + full-frame PSRAM push");
 
     lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
@@ -675,43 +665,43 @@ void setup() {
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
     if (!psramOk) { while (1) delay(1000); }
 
-    // ── decodeTemp: SRAM scratch for upscale path ───────────────────────────
-    // When upscale mode is active, QOI decodes here first (srcW×srcH < TILE_W×TILE_H),
-    // then tileFb gets the small decoded tile; displayTask's pushImage upscales it.
-    // In full-size mode this buffer is unused but allocated so mode can switch at runtime.
-    // Size: TILE_PIXELS * 2 = 38 KB SRAM. Worth it for seamless mode switching.
+    // ── Allocate SRAM decode scratch (Core-1 exclusive) ──────────────────────
+    // QOI decoder writes tile pixels here first (sequential SRAM writes, L1 hot).
+    // Row-stride memcpy then copies each row into the correct XY offset of frameFb.
+    // Also used as intermediate for the upscale path (srcW×srcH → TILE_W×TILE_H).
+    // TILE_PIXELS * 2 = 38 KB, 16-byte aligned.
     decodeTemp = (uint16_t*)heap_caps_aligned_alloc(
         16, TILE_PIXELS * 2,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!decodeTemp) {
-        Serial.println("[WARN] decodeTemp SRAM alloc failed — upscale modes unavailable");
-        // Non-fatal: full-size mode still works without it
+        Serial.println("[ERROR] decodeTemp SRAM alloc failed");
+        statusLine(2, "DecTemp:", "ALLOC FAILED!", TFT_RED);
+        while (1) delay(1000);
     }
 
-    // ── Allocate pipeline slot assembly buffers in SRAM ──────────────────────
-    // QOI encoder on PC enforces MAX_TILE_QOI.  Assembly sized at MAX_TILE_QOI.
+    // ── Allocate pipeline slots ────────────────────────────────────────────────
+    // 16-byte aligned: satisfies any future SIMD / DMA constraints on the source buffer.
     // SRAM chosen: QOI reads src forward-sequentially → L1 cache hit rate ~100%.
     bool allocOk = true;
     for (int s = 0; s < 2; s++) {
-        slot[s].assembly = (uint8_t*)heap_caps_malloc(
-            MAX_TILE_QOI, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(
+            16, MAX_TILE_QOI, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!slot[s].assembly) {
             Serial.printf("[ERROR] slot[%d].assembly SRAM alloc failed\n", s);
             allocOk = false; break;
         }
     }
 
-    // ── Allocate double-buffered per-tile framebuffers in PSRAM ──────────────
-    // QOI decoder writes here DIRECTLY — no SRAM intermediate.
-    // 16-byte alignment for potential future DMA / burst-write use.
+    // ── Allocate double-buffered full-frame framebuffers in PSRAM ─────────────
+    // 320×240×2 = 153,600 bytes each. 16-byte aligned for row-stride memcpy bursts.
+    // Core 1 row-stride copies each decoded tile into the correct XY region;
+    // displayTask pushes one atomic lcd.pushImage(0,0,320,240) per frame.
     for (int s = 0; s < 2 && allocOk; s++) {
-        for (int t = 0; t < NUM_TILES && allocOk; t++) {
-            tileFb[s][t] = (uint16_t*)heap_caps_aligned_alloc(
-                16, TILE_PIXELS * 2, MALLOC_CAP_SPIRAM);
-            if (!tileFb[s][t]) {
-                Serial.printf("[ERROR] tileFb[%d][%d] PSRAM alloc failed\n", s, t);
-                allocOk = false;
-            }
+        frameFb[s] = (uint16_t*)heap_caps_aligned_alloc(
+            16, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
+        if (!frameFb[s]) {
+            Serial.printf("[ERROR] frameFb[%d] PSRAM alloc failed\n", s);
+            allocOk = false;
         }
     }
 
@@ -736,35 +726,30 @@ void setup() {
 
     // ── Pipeline sync primitives ──────────────────────────────────────────────
     decodeQueue  = xQueueCreate(1, sizeof(DecodeMsg));
-    displayQueue = xQueueCreate(1, sizeof(DisplayMsg));   // depth-1: render blocks until display drains
+    displayQueue = xQueueCreate(2, sizeof(DisplayMsg));   // depth-2: Core 1 never blocks mid-push
     for (int s = 0; s < 2; s++) {
         slotFree[s] = xSemaphoreCreateBinary();
         xSemaphoreGive(slotFree[s]);
     }
-    // Both display buffers start free (render may write into either)
-    for (int s = 0; s < 2; s++) {
-        bufFree[s] = xSemaphoreCreateBinary();
-        xSemaphoreGive(bufFree[s]);
-    }
 
     // ── Memory layout report ──────────────────────────────────────────────────
-    Serial.printf("[MEM] --- QOI pipeline (upscale-capable) ---\n");
+    Serial.printf("[MEM] --- QOI pipeline (full-frame, upscale-capable) ---\n");
+    Serial.printf("[MEM] decodeTemp       : %u B SRAM  (16-byte aligned; QOI scratch + upscale)\n",
+                  TILE_PIXELS * 2);
     Serial.printf("[MEM] slot[0].assembly : %u B SRAM  (QOI stream, fwd-sequential)\n", MAX_TILE_QOI);
     Serial.printf("[MEM] slot[1].assembly : %u B SRAM\n", MAX_TILE_QOI);
-    Serial.printf("[MEM] decodeTemp       : %u B SRAM  (upscale scratch; unused in full mode)\n",
-                  decodeTemp ? (unsigned)(TILE_PIXELS*2) : 0u);
-    Serial.printf("[MEM] tileFb x2x4      : %u B PSRAM (16-byte aligned, double-buffered)\n",
-                  2 * NUM_TILES * TILE_PIXELS * 2);
+    Serial.printf("[MEM] frameFb x2       : %u B PSRAM (16-byte aligned, double-buffered)\n",
+                  2 * SCREEN_W * SCREEN_H * 2);
     Serial.printf("[MEM] chunkStorage x4  : %u B PSRAM\n",
                   NUM_TILES * MAX_TILE_CHUNKS * CHUNK_DATA_SIZE);
     Serial.printf("[MEM] free SRAM  : %lu KB / %lu KB\n",
-        heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024,
-        heap_caps_get_total_size(MALLOC_CAP_INTERNAL)/1024);
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL)  / 1024,
+        heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024);
     Serial.printf("[MEM] free PSRAM : %lu KB / %lu KB\n",
-        heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024,
-        heap_caps_get_total_size(MALLOC_CAP_SPIRAM)/1024);
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM)  / 1024,
+        heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
 
-    statusLine(2, "Buffers:", "QOI direct-PSRAM", TFT_GREEN);
+    statusLine(2, "Buffers:", "QOI full-frame", TFT_GREEN);
 
     // ── WiFi ──────────────────────────────────────────────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
@@ -784,7 +769,7 @@ void setup() {
     char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
     statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
     statusLine(4, "UDP:", String(UDP_PORT).c_str(), TFT_CYAN);
-    statusLine(5, "Mode:", "QOI 4-tile ping-pong", TFT_CYAN);
+    statusLine(5, "Mode:", "QOI full-frame", TFT_CYAN);
     statusLine(6, "Status:", "Waiting for PC...", TFT_YELLOW);
     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
 
@@ -797,71 +782,48 @@ void setup() {
 //  MAIN LOOP  (Core 1 — renderer)
 // ─────────────────────────────────────────────
 // Core 1 is 100% dedicated to QOI decode.
-// qoi_to_rgb565be() runs here: reads SRAM assembly, writes PSRAM tileFb directly.
-// No MCU scatter-write phase, no bswap16 pass, no memcpy — one sequential decode.
+// Per tile: qoi_to_rgb565be → decodeTemp (SRAM) → row-stride memcpy → frameFb (PSRAM).
+// When all 4 tiles ready: post DisplayMsg → displayQueue, flip writeSet.
 //
-//  Buffer ownership protocol (fixes the 3 sync bugs):
-//
-//  Render holds tileFb[writeSet] exclusively while readyMask is being built.
-//  It acquires that ownership (bufFree[writeSet]) before the FIRST tile decode
-//  of each new batch, and transfers ownership to displayTask by posting to
-//  displayQueue.  displayTask gives bufFree[bufSet] after it finishes pushing.
-//
-//  writeSet ONLY flips on a SUCCESSFUL send to displayQueue.
-//  On a failed send, bufFree[writeSet] is given back immediately so displayTask
-//  (which is presumably backed up) can still finish and free the buffer.
-//
-//  bufTaken tracks whether we already hold bufFree[writeSet] for the current
-//  batch, so frame aborts (readyMask reset mid-collection) don't double-take.
+// depth-2 displayQueue + Core 0 idle headroom means the queue send almost never blocks.
+// writeSet flips regardless of whether the send succeeds, so the decoder always moves on.
+// On a failed send (display task fell behind) the frame is counted as aborted.
 void loop() {
     static bool     streamStarted = false;
     static uint32_t decodeAcc     = 0;
     static uint32_t decodeCount   = 0;
 
-    static uint8_t  pendingFrame  = 0xFF;
-    static uint8_t  readyMask     = 0;
-    static uint32_t frameStartMs  = 0;
-    static bool     bufTaken      = false;   // true while we hold bufFree[writeSet]
+    // Frame-sync presentation state (Core 1 only)
+    static uint8_t  pendingFrame = 0xFF;
+    static uint8_t  readyMask    = 0;
+    static uint32_t frameStartMs = 0;
 
     DecodeMsg msg;
+    // 40 ms timeout → ~25 fps floor before logging idle
     if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) return;
 
     // ── Stale frame guard ─────────────────────────────────────────────────────
     if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
-        // Abandon in-progress frame; release buffer ownership so displayTask
-        // can unblock if it was waiting on a previous queue entry.
-        if (bufTaken) {
-            xSemaphoreGive(bufFree[writeSet]);
-            bufTaken = false;
-        }
         pendingFrame = 0xFF;
         readyMask    = 0;
         frameStartMs = 0;
     }
 
     // ── New frameId → start collecting tiles for this frame ───────────────────
+    // Count any incomplete prior frame as aborted.
     if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
         if (pendingFrame != 0xFF && readyMask != 0)
             g_abortedFrames++;
-        // Do NOT release bufFree here: we keep exclusive ownership of writeSet
-        // and continue writing the new frame into the same buffer.  The old
-        // partial tiles will be overwritten before readyMask ever reaches 0x0F.
         pendingFrame = msg.frameId;
         readyMask    = 0;
         frameStartMs = millis();
     }
 
-    // ── Acquire buffer ownership before the first tile write ──────────────────
-    // Blocks if displayTask is still reading this buffer (prevents the race
-    // where writeSet has cycled back to a buffer not yet fully pushed).
-    if (!bufTaken) {
-        xSemaphoreTake(bufFree[writeSet], portMAX_DELAY);
-        bufTaken = true;
-    }
-
     // ── Decode ────────────────────────────────────────────────────────────────
     uint32_t decUs = 0;
     bool ok = decodeSlot(msg, decUs);
+
+    // Release slot immediately — net can now write to it
     xSemaphoreGive(slotFree[msg.slotIdx]);
 
     if (ok) {
@@ -871,6 +833,7 @@ void loop() {
 
         readyMask |= (uint8_t)(1u << msg.tId);
 
+        // Update cross-core average every 16 tiles — amortises volatile write cost
         if (decodeCount >= 16) {
             g_avgDecodeUs = decodeAcc / decodeCount;
             decodeAcc = 0; decodeCount = 0;
@@ -889,23 +852,13 @@ void loop() {
                           g_avgDecodeUs, 1000000ul / g_avgDecodeUs);
         }
 
-        // ── All 4 tiles for this frame are decoded — attempt to display ───────
+        // All 4 tiles of this frame decoded → post to display task.
+        // depth-2 queue + Core 0 idle headroom means this almost never blocks.
         if (readyMask == 0x0F) {
             DisplayMsg dmsg = { msg.frameId, writeSet };
-
-            if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) == pdTRUE) {
-                // Ownership of tileFb[writeSet] transferred to displayTask.
-                // Flip to the other buffer for the next frame.
-                writeSet ^= 1;
-                bufTaken = false;   // will take bufFree[new writeSet] on next batch
-            } else {
-                // displayTask is backed up; discard this frame and release
-                // the buffer so displayTask can eventually drain and unblock.
-                xSemaphoreGive(bufFree[writeSet]);
-                bufTaken = false;
-                g_abortedFrames++;
-            }
-
+            if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
+                g_abortedFrames++;   // display task fell behind — drop frame
+            writeSet ^= 1;   // flip regardless — decoder must move on
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;
