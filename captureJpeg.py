@@ -39,13 +39,6 @@ DEFAULT_PACING_STEPS = 20
 PACING_MAX_STEPS     = 20
 PACING_STEP_S        = 0.0001        # 0.1 ms per step
 
-# Encoding heuristics
-DITHER_AMT        = 2
-DITHER_VAR_THRESH = 15
-
-# Unsharp mask
-SHARPEN_GAUSS_SIGMA = 0.5
-
 # Cursor overlay
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
@@ -76,9 +69,6 @@ UNIX_NICE_LEVEL = -10
 frame_queue = Queue(maxsize=1)
 stop_event  = threading.Event()
 _frame_id   = 0
-
-STATIC_NOISE = np.zeros((ESP_H, ESP_W, 3), dtype=np.int8)
-cv2.randn(STATIC_NOISE, 0, 2)
 
 # ─────────────────────────────────────────────
 #  SYSTEM HELPERS
@@ -111,6 +101,7 @@ def get_mouse_pos():
 
 def select_monitor():
     # Use the highest-index sub-FHD monitor; fall back to lowest resolution.
+    # Returns (idx, monitor_dict) — caller gets geometry without a second mss open.
     with mss.mss() as sct:
         monitors = sct.monitors
         indices  = list(range(1, len(monitors)))
@@ -119,19 +110,11 @@ def select_monitor():
         if candidates:
             idx = candidates[-1]
             print(f"[Monitor] Using highest sub-FHD -> index {idx}  (candidates: {candidates})")
-            return idx
-        idx = min(indices, key=lambda i: monitors[i]["width"] * monitors[i]["height"])
-        print(f"[Monitor] No sub-FHD found. Falling back to lowest resolution: index {idx} "
-              f"({monitors[idx]['width']}x{monitors[idx]['height']})")
-        return idx
-
-# ─────────────────────────────────────────────
-#  CONTENT ANALYSIS
-# ─────────────────────────────────────────────
-def scene_variance(frame_small: np.ndarray) -> float:
-    """Return luminance std-dev for dither decision."""
-    gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-    return float(cv2.meanStdDev(gray)[1][0][0])
+        else:
+            idx = min(indices, key=lambda i: monitors[i]["width"] * monitors[i]["height"])
+            print(f"[Monitor] No sub-FHD found. Falling back to lowest resolution: index {idx} "
+                  f"({monitors[idx]['width']}x{monitors[idx]['height']})")
+        return idx, dict(monitors[idx])
 
 # ─────────────────────────────────────────────
 #  TRANSMIT — tiled chunked UDP
@@ -139,8 +122,16 @@ def scene_variance(frame_small: np.ndarray) -> float:
 _send_buf  = bytearray(8 + CHUNK_DATA_SIZE)
 _send_view = memoryview(_send_buf)
 
-# 4:2:0 chroma subsampling — best size/quality tradeoff for RGB565 targets.
-_JPEG_SUB_FLAG = cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420
+# Chroma subsampling modes — trackbar selects index 0/1/2
+# 420: 2x2,1x1,1x1 — smallest JPEG, most chroma loss, best for motion
+# 422: 2x1,1x1,1x1 — horizontal half only, good for video/UI content
+# 444: 1x1,1x1,1x1 — no subsampling, sharpest, ~30% larger than 420
+# All three decode transparently on ESP32_JPEG — no ESP change needed.
+_JPEG_SUB_MODES = {
+    0: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420, "4:2:0"),
+    1: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_422, "4:2:2"),
+    2: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444, "4:4:4"),
+}
 
 def _send_udp(sock: socket.socket, data, dest):
     """Blocking-safe sendto for a non-blocking socket."""
@@ -152,8 +143,10 @@ def _send_udp(sock: socket.socket, data, dest):
             time.sleep(SEND_RETRY_SLEEP_S)
 
 def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
-               quality: int, pacing_s: float = 0.0) -> int:
+               quality: int, pacing_s: float = 0.0, sub_flag: int = None) -> int:
     global _frame_id
+    if sub_flag is None:
+        sub_flag = cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420
 
     frame_id  = _frame_id & 0xFF
     _frame_id = (_frame_id + 1) & 0xFF
@@ -166,9 +159,9 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
 
         _, enc = cv2.imencode('.jpg', tile,
                               [int(cv2.IMWRITE_JPEG_QUALITY), quality,
-                               int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), _JPEG_SUB_FLAG])
-        jpeg_bytes = bytes(enc)
-        total_len  = len(jpeg_bytes)
+                               int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
+        total_len = len(enc)    # enc is uint8 ndarray — wrap in memoryview for bytearray assignment
+        enc_view  = memoryview(enc)
 
         if total_len > MAX_TILE_JPEG:
             print(f"[WARN] Tile {tId} JPEG {total_len}B > MAX_TILE_JPEG — lower quality")
@@ -191,7 +184,7 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
             _send_buf[5] = num_chunks
             _send_buf[6] = size_hi
             _send_buf[7] = size_lo
-            _send_buf[8:8+clen] = jpeg_bytes[offset:offset+clen]
+            _send_buf[8:8+clen] = enc_view[offset:offset+clen]
 
             _send_udp(sock, _send_view[:8+clen], dest)
 
@@ -250,7 +243,7 @@ def _sram_color(free_kb_str: str):
 # ─────────────────────────────────────────────
 #  STREAM + UI
 # ─────────────────────────────────────────────
-def stream_mss_udp(target_ip: str, monitor_idx: int):
+def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0', 0))
     sock.setblocking(False)
@@ -261,13 +254,15 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
     cv2.createTrackbar("Base Qual",     WINDOW_NAME, DEFAULT_QUAL,         95,               lambda x: None)
     cv2.createTrackbar("Pacing x0.1ms", WINDOW_NAME, DEFAULT_PACING_STEPS, PACING_MAX_STEPS, lambda x: None)
     cv2.createTrackbar("Sharpen x0.1",  WINDOW_NAME, 6,                    20,               lambda x: None)
+    cv2.createTrackbar("Chroma sub",    WINDOW_NAME, 0,                    2,                lambda x: None)
     cv2.createTrackbar("Debug Info",    WINDOW_NAME, 1,                    1,                lambda x: None)
 
     threading.Thread(target=capture_worker, args=(monitor_idx,), daemon=True).start()
 
-    with mss.mss() as sct:
-        m = sct.monitors[monitor_idx]
-        m_left, m_top, m_w, m_h = m["left"], m["top"], m["width"], m["height"]
+    m_left = monitor_info["left"]
+    m_top  = monitor_info["top"]
+    m_w    = monitor_info["width"]
+    m_h    = monitor_info["height"]
 
     latest_esp_stats = {}
     last_debug_send  = 0
@@ -282,9 +277,11 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
             user_qual     = cv2.getTrackbarPos("Base Qual",      WINDOW_NAME)
             pacing_steps  = cv2.getTrackbarPos("Pacing x0.1ms", WINDOW_NAME)
             sharpen_steps = cv2.getTrackbarPos("Sharpen x0.1",  WINDOW_NAME)
+            sub_idx       = cv2.getTrackbarPos("Chroma sub",     WINDOW_NAME)
             debug_state   = cv2.getTrackbarPos("Debug Info",     WINDOW_NAME)
             pacing_s      = pacing_steps * PACING_STEP_S
             sharpen_amt   = sharpen_steps * 0.1
+            sub_flag, sub_str = _JPEG_SUB_MODES.get(sub_idx, _JPEG_SUB_MODES[0])
 
             try:
                 while True:
@@ -309,18 +306,15 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
 
             resized = cv2.resize(frame, (ESP_W, ESP_H), interpolation=cv2.INTER_AREA)
 
-            # Dither low-variance (flat) scenes to reduce JPEG blocking artifacts
-            if scene_variance(resized) < DITHER_VAR_THRESH:
-                n = (STATIC_NOISE.astype(np.float32) * (DITHER_AMT / 2.0)).astype(np.int8)
-                resized = cv2.add(resized, n, dtype=cv2.CV_8U)
-
-            # Unsharp mask (trackbar-controlled)
+            # Unsharp mask (trackbar-controlled) — sigma scales with amount
             if sharpen_amt > 0.0:
-                blurred = cv2.GaussianBlur(resized, (0, 0), SHARPEN_GAUSS_SIGMA)
+                _sigma  = 0.3 + sharpen_amt * 0.35   # 0.3 @ step 1 → 1.05 @ step 20
+                blurred = cv2.GaussianBlur(resized, (0, 0), _sigma)
                 resized = cv2.addWeighted(resized, 1.0 + sharpen_amt,
                                           blurred, -sharpen_amt, 0)
 
-            last_frame_bytes = send_tiles(sock, target_ip, resized, user_qual, pacing_s=pacing_s)
+            last_frame_bytes = send_tiles(sock, target_ip, resized, user_qual,
+                                          pacing_s=pacing_s, sub_flag=sub_flag)
 
             preview = cv2.resize(resized, (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
             f = latest_esp_stats
@@ -356,7 +350,7 @@ def stream_mss_udp(target_ip: str, monitor_idx: int):
                 per_tile = last_frame_bytes // NUM_TILES if last_frame_bytes else 0
                 pkts_per = (per_tile + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE if per_tile else 0
                 info = (f"Total:{last_frame_bytes}B  PerTile:~{per_tile}B/{pkts_per}pkts "
-                        f"Q:{user_qual} Pace:{pacing_steps * PACING_STEP_S * 1000:.1f}ms")
+                        f"Q:{user_qual} Sub:{sub_str} Pace:{pacing_steps * PACING_STEP_S * 1000:.1f}ms")
                 cv2.putText(preview, info, (10, PREVIEW_H - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
@@ -387,9 +381,12 @@ def find_esp(timeout=15.0) -> str | None:
         while time.time() < deadline:
             try:
                 data, addr = s.recvfrom(256)
-                if data.decode('utf-8', errors='ignore').strip() == "S3READY":
-                    print(f"[Discovery] ESP32-S3 found at {addr[0]}")
-                    return addr[0]
+                try:
+                    if data.decode('utf-8', errors='ignore').strip() == "S3READY":
+                        print(f"[Discovery] ESP32-S3 found at {addr[0]}")
+                        return addr[0]
+                except Exception:
+                    pass
             except socket.timeout: pass
     finally:
         s.close()
@@ -407,7 +404,8 @@ if __name__ == "__main__":
     # ip = "192.168.x.x"   # <- uncomment and hardcode if discovery fails
 
     if ip:
-        stream_mss_udp(ip, select_monitor())
+        mon_idx, mon_info = select_monitor()
+        stream_mss_udp(ip, mon_idx, mon_info)
     else:
         print("[ERROR] No ESP32-S3 found. Make sure it broadcasts 'S3READY'.")
 

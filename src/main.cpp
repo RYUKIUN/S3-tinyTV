@@ -219,14 +219,11 @@ static IRAM_ATTR int assembleTileInto(uint8_t t, uint8_t* dst) {
     if (offset < 4 ||
         dst[0] != 0xFF || dst[1] != 0xD8 ||
         dst[offset-2] != 0xFF || dst[offset-1] != 0xD9) {
-        Serial.printf("[TILE%u] bad markers len=%d [%02X%02X..%02X%02X]\n",
-            t, offset, dst[0], dst[1], dst[offset-2], dst[offset-1]);
         ts.stat_corrupt++;
         return 0;
     }
     return offset;
 }
-
 // ─────────────────────────────────────────────
 //  DECODE PIPELINE
 // ─────────────────────────────────────────────
@@ -274,25 +271,21 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
 
     // Early guards — cheap checks before any decode work
     if ((uintptr_t)s.assembly & 15) {
-        Serial.printf("[DEC] slot%u assembly not 16-byte aligned\n", msg.slotIdx);
         decodeUs = 0;
         return false;
     }
     if (msg.tId >= NUM_TILES || frameFb[writeSet] == nullptr) {
-        Serial.printf("[DEC] invalid tId=%u or null frameFb\n", msg.tId);
         decodeUs = 0;
         return false;
     }
 
     // ── Decode LE pixels into SRAM scratch ───────────────────────────────
-    // Avoids 1200x PSRAM scatter-writes; all MCU writes hit L1 cache.
     mcuCtx.fb = decodeTemp;
     if (!jpeg_dec.openRAM(s.assembly, msg.len, mcuCallback)) {
-        Serial.printf("[DEC] slot%u open err=%d\n", msg.slotIdx, jpeg_dec.getLastError());
         decodeUs = 0;
         return false;
     }
-    // RGB565_LITTLE_ENDIAN keeps JPEGDEC on its PIE assembly path (jpegimc.S).
+    
     jpeg_dec.setPixelType(RGB565_LITTLE_ENDIAN);
     jpeg_dec.setUserPointer(&mcuCtx);
 
@@ -301,15 +294,11 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     jpeg_dec.close();
 
     if (!rc) {
-        Serial.printf("[DEC] slot%u decode err=%d len=%u\n",
-                      msg.slotIdx, jpeg_dec.getLastError(), msg.len);
         decodeUs = 0;
         return false;
     }
 
     // ── Combined PIE bswap + SRAM->PSRAM copy, row-stride into full frameFb ─
-    // Each tile row (TILE_W pixels) is written into its correct XY position
-    // within the 320-wide frameFb. TILE_W=160=5x32 -> no tail per row.
     uint16_t* fbBase = frameFb[writeSet]
                      + TILE_Y[msg.tId] * SCREEN_W
                      + TILE_X[msg.tId];
@@ -322,7 +311,6 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     decodeUs = micros() - t0;
     return true;
 }
-
 // ─────────────────────────────────────────────
 //  NETWORK TASK  (Core 0)
 // ─────────────────────────────────────────────
@@ -337,7 +325,7 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
 //   4. back ^= 1
 static IRAM_ATTR void networkTask(void*) {
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (g_sock < 0) { Serial.println("[NET] socket fail"); vTaskDelete(NULL); return; }
+    if (g_sock < 0) { vTaskDelete(NULL); return; }
 
     int rcvbuf = 65536;
     setsockopt(g_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -347,12 +335,11 @@ static IRAM_ATTR void networkTask(void*) {
     local.sin_port        = htons(UDP_PORT);
     local.sin_addr.s_addr = INADDR_ANY;
     if (bind(g_sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
-        Serial.println("[NET] bind fail"); close(g_sock); vTaskDelete(NULL); return;
+        close(g_sock); vTaskDelete(NULL); return;
     }
     fcntl(g_sock, F_SETFL, O_NONBLOCK);
-    Serial.printf("[NET] UDP ready port=%d\n", UDP_PORT);
 
-    // rxBuf is static — avoids stack pressure (stack budgeted at 10 KB)
+    // rxBuf is static — avoids stack pressure
     static uint8_t rxBuf[CHUNK_DATA_SIZE + 16];
     struct sockaddr_in sender;
     socklen_t slen = sizeof(sender);
@@ -364,12 +351,10 @@ static IRAM_ATTR void networkTask(void*) {
                          (struct sockaddr*)&sender, &slen);
 
         if (n < 0) {
-            // 1 ms select — responsive first-packet detection
             fd_set rfds; FD_ZERO(&rfds); FD_SET(g_sock, &rfds);
             struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
             select(g_sock + 1, &rfds, NULL, NULL, &tv);
 
-            // Beacon if no traffic for 2 s
             if ((millis() - lastBeaconMs) > 2000 && (millis() - lastPktMs) > 2000) {
                 struct sockaddr_in bc = {};
                 bc.sin_family         = AF_INET;
@@ -389,13 +374,11 @@ static IRAM_ATTR void networkTask(void*) {
         memcpy(&g_remoteAddr, &sender, sizeof(sender));
         g_remoteAddrValid = true;
 
-        // ── Control packet ─────────────────────────────────────────────────
         if (rxBuf[1] == 0xCC) {
             if (n >= 4 && rxBuf[2] == 0x01) debugEnabled = (rxBuf[3] == 1);
             portYIELD(); continue;
         }
 
-        // ── Tile data chunk ────────────────────────────────────────────────
         if (rxBuf[1] != 0xBB || n < 8) { portYIELD(); continue; }
         uint8_t  fId     = rxBuf[2];
         uint8_t  tId     = rxBuf[3];
@@ -407,14 +390,11 @@ static IRAM_ATTR void networkTask(void*) {
 
         TileState& ts = tiles[tId];
 
-        // Timeout stale reassembly
         if (ts.firstChunkMs > 0 && (millis() - ts.firstChunkMs) > TILE_TIMEOUT_MS) {
-            Serial.printf("[TILE%u] timeout got=%u/%u\n", tId, ts.chunksGot, ts.totalChunks);
             ts.stat_timeout++;
             resetTile(tId);
         }
 
-        // New frame for this tile
         if (fId != ts.frameId) {
             resetTile(tId);
             ts.frameId      = fId;
@@ -423,7 +403,6 @@ static IRAM_ATTR void networkTask(void*) {
             ts.firstChunkMs = millis();
         }
 
-        // Store chunk into PSRAM staging area
         if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
             memcpy(ts.chunkBuf[cId], &rxBuf[8], dataLen);
             ts.chunkLen[cId] = (uint16_t)dataLen;
@@ -431,12 +410,8 @@ static IRAM_ATTR void networkTask(void*) {
             ts.chunksGot++;
         }
 
-        // All chunks received -> feed the pipeline
         if (ts.chunksGot >= ts.totalChunks) {
-            // Wait for renderer to vacate the slot we're about to fill.
-            // In steady state returns immediately.
             xSemaphoreTake(slotFree[back], portMAX_DELAY);
-
             int len = assembleTileInto(tId, slot[back].assembly);
 
             if (len > 0) {
@@ -444,26 +419,20 @@ static IRAM_ATTR void networkTask(void*) {
                 xQueueSend(decodeQueue, &msg, portMAX_DELAY);
                 back ^= 1;
             } else {
-                // Corrupt JPEG: slot never used — return semaphore immediately
                 xSemaphoreGive(slotFree[back]);
-                // stat_corrupt already incremented inside assembleTileInto
             }
-
             resetTile(tId);
         }
 
-        // ── Periodic stat report ───────────────────────────────────────────
-        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 1000) {
+        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 500) {
             uint32_t el = millis() - lastStatMs;
 
-            // FPS: count frames actually presented to LCD
             static uint32_t lastPresented = 0;
             uint32_t nowPresented = g_presentedFrames;
             uint32_t frames = nowPresented - lastPresented;
             lastPresented = nowPresented;
             float fps = frames / (el / 1000.0f);
 
-            // Drops: corrupt + timeout. Aborted: partial frames due to frameId switch.
             uint32_t totalDrop = 0;
             for (int i = 0; i < NUM_TILES; i++)
                 totalDrop += tiles[i].stat_corrupt + tiles[i].stat_timeout;
@@ -478,7 +447,7 @@ static IRAM_ATTR void networkTask(void*) {
             uint32_t freePSR   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
             uint32_t totalPSR  = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
             float    tempC     = temperatureRead();
-            uint32_t decUs     = g_avgDecodeUs;  // 32-bit aligned volatile read, atomic on LX7
+            uint32_t decUs     = g_avgDecodeUs; 
 
             snprintf(debugBuf, sizeof(debugBuf),
                 "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"
@@ -492,7 +461,6 @@ static IRAM_ATTR void networkTask(void*) {
             sendto(g_sock, debugBuf, strlen(debugBuf), 0,
                    (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
 
-            // Reset per-window counters
             for (int i = 0; i < NUM_TILES; i++)
                 tiles[i].stat_decoded = tiles[i].stat_corrupt = tiles[i].stat_timeout = 0;
             pktCount = 0;
@@ -502,7 +470,6 @@ static IRAM_ATTR void networkTask(void*) {
         portYIELD();
     }
 }
-
 // ─────────────────────────────────────────────
 //  DISPLAY HELPERS
 // ─────────────────────────────────────────────
@@ -550,7 +517,7 @@ void setup() {
     while (!Serial && (millis() - t0) < 2000) delay(10);
     Serial.println("\n[BOOT] ping-pong pipeline (SRAM decode + combined bswap/copy)");
 
-    lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
+    lcd.init(); lcd.setRotation(1); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
     drawBootHeader();
     statusLine(0, "Display:", "OK", TFT_GREEN);
@@ -676,24 +643,19 @@ void loop() {
     static uint32_t decodeAcc     = 0;
     static uint32_t decodeCount   = 0;
 
-    // Frame-sync presentation state (Core 1 only)
     static uint8_t  pendingFrame = 0xFF;
     static uint8_t  readyMask    = 0;
     static uint32_t frameStartMs = 0;
 
     DecodeMsg msg;
-    // 40 ms timeout -> ~25 fps floor before logging idle
     if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) return;
 
-    // Discard stale partial frame that will never complete
     if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
         pendingFrame = 0xFF;
         readyMask    = 0;
         frameStartMs = 0;
     }
 
-    // New frameId -> start collecting tiles for that frame.
-    // Count any incomplete prior frame as aborted.
     if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
         if (pendingFrame != 0xFF && readyMask != 0)
             g_abortedFrames++;
@@ -705,7 +667,6 @@ void loop() {
     uint32_t decUs = 0;
     bool ok = decodeSlot(msg, decUs);
 
-    // Release slot immediately — net can now write to it
     xSemaphoreGive(slotFree[msg.slotIdx]);
 
     if (ok) {
@@ -715,7 +676,6 @@ void loop() {
 
         readyMask |= (uint8_t)(1u << msg.tId);
 
-        // Update cross-core average every 16 tiles — amortises volatile write cost
         if (decodeCount >= 16) {
             g_avgDecodeUs = decodeAcc / decodeCount;
             decodeAcc = 0; decodeCount = 0;
@@ -724,30 +684,23 @@ void loop() {
         if (!streamStarted) {
             streamStarted = true;
             statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
-            Serial.printf("[RENDER] first tile=%u slot=%u len=%u dec=%luus\n",
-                          msg.tId, msg.slotIdx, msg.len, decUs);
-            delay(200);
+            // ลบ Serial.printf ของ First Tile ออก และคง delay ไว้ให้จออัปเดตทัน
+            delay(200); 
         }
 
-        if ((tiles[msg.tId].stat_decoded % 120) == 0 && g_avgDecodeUs > 0) {
-            Serial.printf("[RENDER] avg decode: %lu us  (%lu fps-equiv)\n",
-                          g_avgDecodeUs, 1000000ul / g_avgDecodeUs);
-        }
+        // ลบ Serial.printf ของ avg decode ทุกๆ 120 เฟรมออกไปแล้ว
 
-        // All 4 tiles of this frame decoded -> post to display task.
-        // depth-2 queue + Core 0 idle headroom means this almost never blocks.
         if (readyMask == 0x0F) {
             DisplayMsg dmsg = { msg.frameId, writeSet };
             if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
-                g_abortedFrames++;   // display task fell behind — drop frame
-            writeSet ^= 1;   // flip regardless — decoder must move on
+                g_abortedFrames++;   
+            writeSet ^= 1;   
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;
         }
     }
 
-    // Jitter — measured at tile-delivery rate (millis, Core 1 only)
     uint32_t now = millis();
     if (stat_prevMs > 0) {
         static uint32_t lastIv = 0;
