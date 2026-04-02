@@ -31,13 +31,13 @@ MAX_TILE_JPEG = 33600            # 24 x 1400
 
 # UI / trackbar defaults
 WINDOW_NAME          = "ESP32-S3 Stream [320x240]"
-UI_W, UI_H           = 480, 620
+UI_W, UI_H           = 480, 660  # Increased height slightly for new trackbar
 PREVIEW_W, PREVIEW_H = 480, 360
 DEFAULT_FPS          = 35
 DEFAULT_QUAL         = 40
 DEFAULT_PACING_STEPS = 20
 PACING_MAX_STEPS     = 20
-PACING_STEP_S        = 0.0001        # 0.1 ms per step
+PACING_STEP_S        = 0.0004        # 0.1 ms per step
 
 # Cursor overlay
 CURSOR_OUTER_R = 8
@@ -101,7 +101,6 @@ def get_mouse_pos():
 
 def select_monitor():
     # Use the highest-index sub-FHD monitor; fall back to lowest resolution.
-    # Returns (idx, monitor_dict) — caller gets geometry without a second mss open.
     with mss.mss() as sct:
         monitors = sct.monitors
         indices  = list(range(1, len(monitors)))
@@ -122,11 +121,6 @@ def select_monitor():
 _send_buf  = bytearray(8 + CHUNK_DATA_SIZE)
 _send_view = memoryview(_send_buf)
 
-# Chroma subsampling modes — trackbar selects index 0/1/2
-# 420: 2x2,1x1,1x1 — smallest JPEG, most chroma loss, best for motion
-# 422: 2x1,1x1,1x1 — horizontal half only, good for video/UI content
-# 444: 1x1,1x1,1x1 — no subsampling, sharpest, ~30% larger than 420
-# All three decode transparently on ESP32_JPEG — no ESP change needed.
 _JPEG_SUB_MODES = {
     0: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420, "4:2:0"),
     1: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_422, "4:2:2"),
@@ -160,7 +154,7 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
         _, enc = cv2.imencode('.jpg', tile,
                               [int(cv2.IMWRITE_JPEG_QUALITY), quality,
                                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
-        total_len = len(enc)    # enc is uint8 ndarray — wrap in memoryview for bytearray assignment
+        total_len = len(enc)    
         enc_view  = memoryview(enc)
 
         if total_len > MAX_TILE_JPEG:
@@ -252,6 +246,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
     cv2.resizeWindow(WINDOW_NAME, UI_W, UI_H)
     cv2.createTrackbar("Max FPS",       WINDOW_NAME, DEFAULT_FPS,          60,               lambda x: None)
     cv2.createTrackbar("Base Qual",     WINDOW_NAME, DEFAULT_QUAL,         95,               lambda x: None)
+    # --- NEW TRACKBAR FOR BILATERAL FILTER ---
+    cv2.createTrackbar("Bilateral Mix", WINDOW_NAME, 0,                    100,              lambda x: None)
     cv2.createTrackbar("Pacing x0.1ms", WINDOW_NAME, DEFAULT_PACING_STEPS, PACING_MAX_STEPS, lambda x: None)
     cv2.createTrackbar("Sharpen x0.1",  WINDOW_NAME, 6,                    20,               lambda x: None)
     cv2.createTrackbar("Chroma sub",    WINDOW_NAME, 0,                    2,                lambda x: None)
@@ -275,10 +271,12 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
 
             fps           = cv2.getTrackbarPos("Max FPS",       WINDOW_NAME)
             user_qual     = cv2.getTrackbarPos("Base Qual",      WINDOW_NAME)
+            bilateral_mix = cv2.getTrackbarPos("Bilateral Mix",  WINDOW_NAME) # Read the new slider
             pacing_steps  = cv2.getTrackbarPos("Pacing x0.1ms", WINDOW_NAME)
             sharpen_steps = cv2.getTrackbarPos("Sharpen x0.1",  WINDOW_NAME)
             sub_idx       = cv2.getTrackbarPos("Chroma sub",     WINDOW_NAME)
             debug_state   = cv2.getTrackbarPos("Debug Info",     WINDOW_NAME)
+            
             pacing_s      = pacing_steps * PACING_STEP_S
             sharpen_amt   = sharpen_steps * 0.1
             sub_flag, sub_str = _JPEG_SUB_MODES.get(sub_idx, _JPEG_SUB_MODES[0])
@@ -305,6 +303,14 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
                 cv2.circle(frame, (rx, ry), CURSOR_INNER_R, (0,   0, 255),  -1)
 
             resized = cv2.resize(frame, (ESP_W, ESP_H), interpolation=cv2.INTER_AREA)
+
+            # ─────────────────────────────────────────────
+            #  NEW: Apply Bilateral Filter (Noise Reduction)
+            # ─────────────────────────────────────────────
+            if bilateral_mix > 0:
+                # d=5 is kept hardcoded here because larger values will destroy UI text.
+                # The slider controls sigmaColor and sigmaSpace (aggressiveness).
+                resized = cv2.bilateralFilter(resized, d=5, sigmaColor=bilateral_mix, sigmaSpace=bilateral_mix)
 
             # Unsharp mask (trackbar-controlled) — sigma scales with amount
             if sharpen_amt > 0.0:

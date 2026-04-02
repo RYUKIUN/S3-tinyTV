@@ -3,11 +3,13 @@
  *
  * PIPELINE ARCHITECTURE
  * ─────────────────────
- *  Two shared slots (back / front) replace the old 4-independent-buffer scheme.
+ *  Four shared slots replace the old 2-slot ping-pong scheme.
+ *  Depth-4 decodeQueue lets networkTask post all 4 tiles without blocking,
+ *  eliminating the UDP dead-zone that drove ABRT rates at high JPEG quality.
  *
  *  Memory layout:
- *    slot[0].assembly  SRAM   33 KB  ─┐ decoder reads every byte → must be fast
- *    slot[1].assembly  SRAM   33 KB  ─┘
+ *    slot[0..3].assembly  SRAM  33 KB each (4 × 33.6 KB = 134.4 KB total)
+ *                                ─ decoder reads every byte → must be fast
  *    decodeTemp        SRAM   38 KB    Core-1 decode scratch; LE pixels from JPEGDEC
  *    frameFb[0]        PSRAM 150 KB  ─┐ full 320×240 frame; DMA source ONLY
  *    frameFb[1]        PSRAM 150 KB  ─┘ double-buffered; display pushes one atomic frame
@@ -110,12 +112,16 @@ static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
 static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 
 // ─────────────────────────────────────────────
-//  PIPELINE SLOTS  (2 shared decode/display buffers)
+//  PIPELINE SLOTS  (4 shared decode/display buffers)
 // ─────────────────────────────────────────────
+// Increased from 2 to 4 so networkTask can post all 4 tile messages to
+// decodeQueue without blocking, eliminating the UDP dead-zone that caused
+// rising ABRT rates at higher JPEG quality.
+#define NUM_SLOTS 4
 struct PipeSlot {
     uint8_t* assembly;   // SRAM — JPEGDEC reads here; single-cycle access critical
 };
-static PipeSlot slot[2];
+static PipeSlot slot[NUM_SLOTS];
 
 // SRAM scratch for Core-1 decode.
 // JPEGDEC scatter-writes LE pixels here; bswap16_memcpy_simd() reads once,
@@ -142,8 +148,11 @@ struct DecodeMsg {
 };
 
 // Pipeline synchronisation
-static QueueHandle_t     decodeQueue;    // depth-1 queue: net -> renderer
-static SemaphoreHandle_t slotFree[2];   // given when renderer finishes slot
+// decodeQueue depth matches NUM_SLOTS (4): networkTask can post all 4 tile
+// messages back-to-back and return to recvfrom immediately, with no blocking
+// on xQueueSend. Core 1 drains the queue at its own pace.
+static QueueHandle_t     decodeQueue;                // depth-4 queue: net -> renderer
+static SemaphoreHandle_t slotFree[NUM_SLOTS];        // given when renderer finishes slot
 
 // Display pipeline: Core 1 posts here when all 4 tiles are ready.
 // Display task (separate) does the blocking pushImage calls.
@@ -319,10 +328,10 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
 //   Control: [0xAA 0xCC 0x01 debugState]
 //
 // Pipeline flow when tile completes:
-//   1. xSemaphoreTake(slotFree[back])     — wait for renderer to vacate slot
-//   2. assembleTileInto(tId, slot[back])  — PSRAM chunks -> SRAM assembly
-//   3. xQueueSend(decodeQueue, &msg)      — block until renderer is ready
-//   4. back ^= 1
+//   1. xSemaphoreTake(slotFree[back])          — wait for renderer to vacate slot
+//   2. assembleTileInto(tId, slot[back])        — PSRAM chunks -> SRAM assembly
+//   3. xQueueSend(decodeQueue, &msg)            — depth-4: returns immediately
+//   4. back = (back + 1) & 3                   — round-robin across 4 slots
 static IRAM_ATTR void networkTask(void*) {
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock < 0) { vTaskDelete(NULL); return; }
@@ -417,7 +426,7 @@ static IRAM_ATTR void networkTask(void*) {
             if (len > 0) {
                 DecodeMsg msg = { fId, tId, back, (uint16_t)len };
                 xQueueSend(decodeQueue, &msg, portMAX_DELAY);
-                back ^= 1;
+                back = (back + 1) & 3;   // round-robin across 4 slots
             } else {
                 xSemaphoreGive(slotFree[back]);
             }
@@ -540,8 +549,10 @@ void setup() {
 
     // ── Allocate pipeline slots ───────────────────────────────────────────
     // 16-byte aligned: satisfies the & 15 guard in decodeSlot.
+    // NUM_SLOTS=4: 4 x 33.6 KB = 134.4 KB SRAM — allows back-to-back tile
+    // posts to depth-4 decodeQueue without blocking networkTask.
     bool allocOk = true;
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < NUM_SLOTS; s++) {
         slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(
             16, MAX_TILE_JPEG, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!slot[s].assembly) {
@@ -579,16 +590,18 @@ void setup() {
     }
 
     // ── Pipeline sync primitives ──────────────────────────────────────────
-    decodeQueue  = xQueueCreate(1, sizeof(DecodeMsg));
+    decodeQueue  = xQueueCreate(NUM_SLOTS, sizeof(DecodeMsg));  // depth-4: no blocking on post
     displayQueue = xQueueCreate(2, sizeof(DisplayMsg));
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < NUM_SLOTS; s++) {
         slotFree[s] = xSemaphoreCreateBinary();
         xSemaphoreGive(slotFree[s]);
     }
 
     Serial.printf("[MEM] decodeTemp       : %u B SRAM (16-byte aligned)\n", TILE_PIXELS * 2);
-    Serial.printf("[MEM] slot[0].assembly : %u B SRAM\n", MAX_TILE_JPEG);
-    Serial.printf("[MEM] slot[1].assembly : %u B SRAM\n", MAX_TILE_JPEG);
+    for (int s = 0; s < NUM_SLOTS; s++)
+        Serial.printf("[MEM] slot[%d].assembly : %u B SRAM\n", s, MAX_TILE_JPEG);
+    Serial.printf("[MEM] SRAM slots total : %u B (%d x %u)\n",
+                  NUM_SLOTS * MAX_TILE_JPEG, NUM_SLOTS, MAX_TILE_JPEG);
     Serial.printf("[MEM] frameFb x2       : %u B PSRAM (16-byte aligned, double-buffered)\n",
                   2 * SCREEN_W * SCREEN_H * 2);
     Serial.printf("[MEM] chunkStorage x4  : %u B PSRAM\n",
@@ -600,7 +613,7 @@ void setup() {
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM)  / 1024,
         heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
 
-    statusLine(2, "Buffers:", "2-slot SRAM-dec", TFT_GREEN);
+    statusLine(2, "Buffers:", "4-slot SRAM-dec", TFT_GREEN);
 
     // ── WiFi ──────────────────────────────────────────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
