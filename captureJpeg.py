@@ -7,6 +7,7 @@ import os
 import psutil
 import ctypes
 import threading
+import shelve
 from queue import Queue
 
 # ─────────────────────────────────────────────
@@ -62,6 +63,11 @@ SEND_RETRY_SLEEP_S   = 0.0005
 
 # Process priority
 UNIX_NICE_LEVEL = -10
+
+# Persisted settings — shelve writes captureJpeg_settings.db next to the script
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captureJpeg_settings")
+SETTINGS_KEYS = ("Max FPS", "Base Qual", "Bilateral Mix", "Pacing x0.1ms",
+                 "Sharpen x0.1", "Chroma sub", "Debug Info")
 
 # ─────────────────────────────────────────────
 #  GLOBAL STATE
@@ -242,16 +248,31 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
     sock.bind(('0.0.0.0', 0))
     sock.setblocking(False)
 
+    # ── Load persisted trackbar values; fall back to defaults on first run ──
+    _tb_cfg = {
+        # name              default                   max
+        "Max FPS":        (DEFAULT_FPS,           60),
+        "Base Qual":      (DEFAULT_QUAL,           95),
+        "Bilateral Mix":  (0,                     100),
+        "Pacing x0.1ms":  (DEFAULT_PACING_STEPS,   PACING_MAX_STEPS),
+        "Sharpen x0.1":   (6,                      20),
+        "Chroma sub":     (0,                       2),
+        "Debug Info":     (1,                       1),
+    }
+    try:
+        with shelve.open(SETTINGS_FILE) as _shelf:
+            _saved = {k: _shelf[k] for k in SETTINGS_KEYS if k in _shelf}
+        print(f"[Settings] Loaded: { {k: _saved.get(k, _tb_cfg[k][0]) for k in SETTINGS_KEYS} }")
+    except Exception as _e:
+        print(f"[Settings] Could not load settings ({_e}), using defaults.")
+        _saved = {}
+
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, UI_W, UI_H)
-    cv2.createTrackbar("Max FPS",       WINDOW_NAME, DEFAULT_FPS,          60,               lambda x: None)
-    cv2.createTrackbar("Base Qual",     WINDOW_NAME, DEFAULT_QUAL,         95,               lambda x: None)
-    # --- NEW TRACKBAR FOR BILATERAL FILTER ---
-    cv2.createTrackbar("Bilateral Mix", WINDOW_NAME, 0,                    100,              lambda x: None)
-    cv2.createTrackbar("Pacing x0.1ms", WINDOW_NAME, DEFAULT_PACING_STEPS, PACING_MAX_STEPS, lambda x: None)
-    cv2.createTrackbar("Sharpen x0.1",  WINDOW_NAME, 6,                    20,               lambda x: None)
-    cv2.createTrackbar("Chroma sub",    WINDOW_NAME, 0,                    2,                lambda x: None)
-    cv2.createTrackbar("Debug Info",    WINDOW_NAME, 1,                    1,                lambda x: None)
+    for _key, (_default, _maxval) in _tb_cfg.items():
+        cv2.createTrackbar(_key, WINDOW_NAME,
+                           _saved.get(_key, _default), _maxval,
+                           lambda x: None)
 
     threading.Thread(target=capture_worker, args=(monitor_idx,), daemon=True).start()
 
@@ -369,6 +390,17 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
     except KeyboardInterrupt:
         print("\n[ESP32-S3] Interrupted.")
     finally:
+        # ── Persist trackbar positions for next run ──
+        try:
+            with shelve.open(SETTINGS_FILE) as _shelf:
+                for _key in SETTINGS_KEYS:
+                    try:
+                        _shelf[_key] = cv2.getTrackbarPos(_key, WINDOW_NAME)
+                    except Exception:
+                        pass
+            print(f"[Settings] Saved trackbar state.")
+        except Exception as _e:
+            print(f"[Settings] Could not save settings: {_e}")
         stop_event.set()
         cv2.destroyAllWindows()
         sock.close()

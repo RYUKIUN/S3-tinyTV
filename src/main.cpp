@@ -61,6 +61,7 @@
 #include <fcntl.h>
 #include <math.h>
 
+
 // ─────────────────────────────────────────────
 //  DISPLAY
 // ─────────────────────────────────────────────
@@ -92,8 +93,8 @@ static LGFX lcd;
 // ─────────────────────────────────────────────
 //  CONFIG
 // ─────────────────────────────────────────────
-const char* WIFI_SSID  = "streaming";
-const char* WIFI_PASS  = "12345678";
+const char* WIFI_SSID  = "Endmin";
+const char* WIFI_PASS  = "987654321";
 const int   UDP_PORT   = 12345;
 
 #define SCREEN_W         320
@@ -613,7 +614,7 @@ void setup() {
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM)  / 1024,
         heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
 
-    statusLine(2, "Buffers:", "4-slot SRAM-dec", TFT_GREEN);
+    statusLine(2, "Buffers:", "Enabled (2 frame depth)", TFT_GREEN);
 
     // ── WiFi ──────────────────────────────────────────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
@@ -623,18 +624,12 @@ void setup() {
         delay(250); tick++;
         char buf[24]; snprintf(buf, sizeof(buf), "Conn%.*s", tick % 5, ".....");
         statusLine(3, "WiFi:", buf, TFT_YELLOW);
-        if (millis() - ws > 20000) {
-            statusLine(3, "WiFi:", "TIMEOUT!", TFT_RED);
-            delay(3000); ESP.restart();
-        }
-    }
     esp_wifi_set_ps(WIFI_PS_NONE);
     String ip = WiFi.localIP().toString();
     char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
     statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
-    statusLine(4, "UDP:",    String(UDP_PORT).c_str(), TFT_CYAN);
-    statusLine(5, "Mode:",   "4-tile Jpeg",       TFT_CYAN);
-    statusLine(6, "Status:", "Waiting for PC...",       TFT_YELLOW);
+    statusLine(4, "Mode:",   "Wireless display",       TFT_CYAN);
+    statusLine(5, "Status:", "Waiting for PC...",       TFT_YELLOW);
     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
 
     // networkTask: priority 3, always preempts displayTask for UDP responsiveness

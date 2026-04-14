@@ -1,0 +1,7 @@
+'Max FPS', (0, 5)
+'Base Qual', (512, 5)
+'Bilateral Mix', (1024, 5)
+'Pacing x0.1ms', (1536, 5)
+'Sharpen x0.1', (2048, 5)
+'Chroma sub', (2560, 5)
+'Debug Info', (3072, 5)
