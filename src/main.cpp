@@ -19,29 +19,29 @@
  *      recvfrom → reassemble chunks → slotAssembly (PSRAM) → post decodeQueue
  *    Core 1 (loop / renderTask):
  *      take decodeQueue
- *      qoi_frame_unpack()               → zero-copy pointers into slotAssembly
- *      qoi_decode_plane() × 3           → Y/Cb/Cr byte planes in decodeTemp (SRAM)
- *      yuv420_to_rgb565_simd()          → RGB565-BE directly into frameFb[writeSet] (PSRAM)
- *      post DisplayMsg → displayQueue
+ *      qoi_tiles_unpack() → pointers to tile0/tile1 QOI streams
+ *      decode tile0 → upper half of frameFb[writeSet] (PSRAM)
+ *      decode tile1 → lower half of frameFb[writeSet] (PSRAM)
+ *      post DisplayMsg → displayQueue (full frame ready)
  *    Core 0 (displayTask, priority 2):
  *      lcd.pushImage(0,0,320,240, frameFb[bufSet])   ← one atomic DMA push/frame
  *
  *  Memory layout
  *  ─────────────
- *    slotAssembly[NUM_SLOTS]  PSRAM MAX_FRAME_QOI bytes each  (QOI packed frame; network writes, decoder reads)
- *    decodeTemp               SRAM  ~116 KB       Y(320×240) + Cb(160×120) + Cr(160×120) planes
- *    frameFb[0]               PSRAM 150 KB  ─┐ double-buffered RGB565-BE; DMA source
+ *    slotAssembly[NUM_SLOTS]  PSRAM MAX_FRAME_QOI bytes each  (QOI packed tiles; network writes, decoder reads)
+ *    decodeTemp               SRAM ~58 KB       Y(320×120) + Cb(160×60) + Cr(160×60) planes (one tile)
+ *    frameFb[0]               PSRAM 150 KB  ─┐ double-buffered full-frame RGB565-BE; tiles decoded directly into upper/lower halves
  *    frameFb[1]               PSRAM 150 KB  ─┘
  *
  *  SRAM budget
- *    decodeTemp               = 116 KB
- *    Total                    = 116 KB  — well within the ~512 KB SRAM on S3
+ *    decodeTemp               = 58 KB
+ *    Total                    = 58 KB  — well within the ~512 KB SRAM on S3
  *
  *  PSRAM budget
- *    NUM_SLOTS × MAX_FRAME_QOI = 400 KB  (2 slots — dual-frame pipeline)
+ *    NUM_SLOTS × MAX_FRAME_QOI = 256 KB  (2 slots — dual-tile pipeline)
  *    frameFb x2               = 300 KB
  *    chunkStorage             = ~47 KB
- *    Total                    = 747 KB  — within 8MB PSRAM
+ *    Total                    = 603 KB  — within 8MB PSRAM
  *
  *  Frame wire format  (magic 0xAA 0xDD replaces 0xAA 0xBB)
  *    [0xAA 0xDD frameId chunkId totalChunks frameSzHi frameSzLo] + payload
@@ -106,23 +106,20 @@ const int   UDP_PORT   = 12345;
 #define SCREEN_W         320
 #define SCREEN_H         240
 
-// Chroma plane dimensions (4:2:0)
-#define CHROMA_W         (SCREEN_W / 2)   // 160
-#define CHROMA_H         (SCREEN_H / 2)   // 120
+// Tile dimensions (upper/lower halves)
+#define TILE_H           (SCREEN_H / 2)   // 120
+#define TILE_Y_BYTES     (SCREEN_W * TILE_H)           // 38 400
+#define TILE_CHROMA_W    (SCREEN_W / 2)                // 160
+#define TILE_CHROMA_H    (TILE_H / 2)                  // 60
+#define TILE_CHROMA_BYTES (TILE_CHROMA_W * TILE_CHROMA_H)  // 9 600
 
-// decodeTemp layout (all in SRAM):
-//   [0 …  76799]  Y  plane  320×240  bytes
-//   [76800 … 96959]  Cb plane  160×120  bytes
-//   [96960 … 117119] Cr plane  160×120  bytes
-#define Y_PLANE_BYTES    (SCREEN_W * SCREEN_H)           // 76 800
-#define CHROMA_BYTES     (CHROMA_W * CHROMA_H)           // 19 200
-#define DECODE_TEMP_SIZE (Y_PLANE_BYTES + 2 * CHROMA_BYTES)  // 115 200
+// decodeTemp layout (for one tile: Y/Cb/Cr planes in SRAM)
+#define DECODE_TEMP_SIZE (TILE_Y_BYTES + 2 * TILE_CHROMA_BYTES)  // 57 600
 
-// Slot size: max packed QOI frame.
-// QOI worst case ≈ raw + overhead.  For 320×240 + 2×(160×120) ≈ 115 200 raw bytes.
-// With QOI overhead headroom:  200 KB is conservative for typical screen content.
-// Bump to 200 KB to be safe.  2 slots × 200 KB = 400 KB PSRAM.
-#define MAX_FRAME_QOI 204800
+// Slot size: max packed QOI frame (two tiles).
+// Each tile ~38KB Y + 9.6KB Cb + 9.6KB Cr = ~57.6KB raw, QOI ~64KB.
+// Two tiles: ~128KB total.
+#define MAX_FRAME_QOI 131072
 
 #define CHUNK_DATA_SIZE  1400
 #define MAX_FRAME_CHUNKS ((MAX_FRAME_QOI + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE)  // 47
@@ -228,11 +225,32 @@ static IRAM_ATTR uint32_t assembleFrameInto(uint8_t* dst) {
 }
 
 // ─────────────────────────────────────────────
+//  QOI TILES UNPACK
+// ─────────────────────────────────────────────
+static IRAM_ATTR bool qoi_tiles_unpack(const uint8_t* src, uint32_t len,
+                                       const uint8_t** tile0, uint32_t* tile0_len,
+                                       const uint8_t** tile1, uint32_t* tile1_len) {
+    if (len < 2) return false;
+    uint32_t y_sz = (src[0] << 8) | src[1];
+    if (len < 2 + y_sz + 2) return false;
+    uint32_t cb_sz = (src[2 + y_sz] << 8) | src[3 + y_sz];
+    if (len < 2 + y_sz + 2 + cb_sz + 2) return false;
+    uint32_t cr_sz = (src[4 + y_sz + cb_sz] << 8) | src[5 + y_sz + cb_sz];
+    uint32_t tile0_size = 2 + y_sz + 2 + cb_sz + 2 + cr_sz;
+    if (len < tile0_size) return false;
+    *tile0 = src;
+    *tile0_len = tile0_size;
+    *tile1 = src + tile0_size;
+    *tile1_len = len - tile0_size;
+    return true;
+}
+
+// ─────────────────────────────────────────────
 //  DECODE PIPELINE  (Core 1)
 // ─────────────────────────────────────────────
-//  1. qoi_frame_unpack()   — split packed buffer into Y/Cb/Cr QOI streams (zero-copy)
-//  2. qoi_decode_plane() × 3 — decode each plane into decodeTemp (SRAM)
-//  3. yuv420_to_rgb565_simd() — convert YUV→RGB565-BE, write into frameFb[writeSet] (PSRAM)
+//  1. qoi_tiles_unpack()   — split packed buffer into tile0/tile1 QOI streams (zero-copy)
+//  2. For each tile: qoi_decode_plane() × 3 → Y/Cb/Cr planes in decodeTemp (SRAM)
+//  3. yuv420_to_rgb565_simd() → RGB565-BE directly into upper/lower half of frameFb[writeSet] (PSRAM)
 static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     if (msg.slotIdx >= NUM_SLOTS || frameFb[writeSet] == nullptr) {
         decodeUs = 0;
@@ -242,40 +260,80 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     PipeSlot& s = slot[msg.slotIdx];
     const uint8_t* src = s.assembly;
 
-    // Unpack: get pointers to the three QOI streams inside the assembly buffer
-    const uint8_t *y_qoi, *cb_qoi, *cr_qoi;
-    uint32_t       y_len,  cb_len,  cr_len;
-    if (!qoi_frame_unpack(src, msg.len, &y_qoi, &y_len, &cb_qoi, &cb_len, &cr_qoi, &cr_len)) {
+    // Unpack: get pointers to the two tile QOI streams inside the assembly buffer
+    const uint8_t *tile0_qoi, *tile1_qoi;
+    uint32_t       tile0_len, tile1_len;
+    if (!qoi_tiles_unpack(src, msg.len, &tile0_qoi, &tile0_len, &tile1_qoi, &tile1_len)) {
         decodeUs = 0;
         return false;
     }
-
-    uint8_t* y_plane  = decodeTemp;
-    uint8_t* cb_plane = decodeTemp + Y_PLANE_BYTES;
-    uint8_t* cr_plane = decodeTemp + Y_PLANE_BYTES + CHROMA_BYTES;
 
     uint32_t t0 = micros();
 
-    // Decode Y
-    if (!qoi_decode_plane(y_qoi, y_len, y_plane, SCREEN_W, SCREEN_H)) {
-        decodeUs = 0;
-        return false;
-    }
-    // Decode Cb
-    if (!qoi_decode_plane(cb_qoi, cb_len, cb_plane, CHROMA_W, CHROMA_H)) {
-        decodeUs = 0;
-        return false;
-    }
-    // Decode Cr
-    if (!qoi_decode_plane(cr_qoi, cr_len, cr_plane, CHROMA_W, CHROMA_H)) {
-        decodeUs = 0;
-        return false;
+    // Decode tile 0 (upper half)
+    {
+        const uint8_t *y_qoi, *cb_qoi, *cr_qoi;
+        uint32_t y_len, cb_len, cr_len;
+        if (!qoi_frame_unpack(tile0_qoi, tile0_len, &y_qoi, &y_len, &cb_qoi, &cb_len, &cr_qoi, &cr_len)) {
+            decodeUs = 0;
+            return false;
+        }
+
+        uint8_t* y_plane  = decodeTemp;
+        uint8_t* cb_plane = decodeTemp + TILE_Y_BYTES;
+        uint8_t* cr_plane = decodeTemp + TILE_Y_BYTES + TILE_CHROMA_BYTES;
+
+        if (!qoi_decode_plane(y_qoi, y_len, y_plane, SCREEN_W, TILE_H)) {
+            decodeUs = 0;
+            return false;
+        }
+        if (!qoi_decode_plane(cb_qoi, cb_len, cb_plane, TILE_CHROMA_W, TILE_CHROMA_H)) {
+            decodeUs = 0;
+            return false;
+        }
+        if (!qoi_decode_plane(cr_qoi, cr_len, cr_plane, TILE_CHROMA_W, TILE_CHROMA_H)) {
+            decodeUs = 0;
+            return false;
+        }
+
+        // YUV → RGB565-BE → upper half of PSRAM framebuffer
+        yuv420_to_rgb565_simd(y_plane, cb_plane, cr_plane,
+                              frameFb[writeSet],
+                              SCREEN_W, TILE_H);
     }
 
-    // YUV → RGB565-BE → PSRAM framebuffer (single pass, SIMD on S3)
-    yuv420_to_rgb565_simd(y_plane, cb_plane, cr_plane,
-                          frameFb[writeSet],
-                          SCREEN_W, SCREEN_H);
+    // Decode tile 1 (lower half)
+    {
+        const uint8_t *y_qoi, *cb_qoi, *cr_qoi;
+        uint32_t y_len, cb_len, cr_len;
+        if (!qoi_frame_unpack(tile1_qoi, tile1_len, &y_qoi, &y_len, &cb_qoi, &cb_len, &cr_qoi, &cr_len)) {
+            decodeUs = 0;
+            return false;
+        }
+
+        uint8_t* y_plane  = decodeTemp;
+        uint8_t* cb_plane = decodeTemp + TILE_Y_BYTES;
+        uint8_t* cr_plane = decodeTemp + TILE_Y_BYTES + TILE_CHROMA_BYTES;
+
+        if (!qoi_decode_plane(y_qoi, y_len, y_plane, SCREEN_W, TILE_H)) {
+            decodeUs = 0;
+            return false;
+        }
+        if (!qoi_decode_plane(cb_qoi, cb_len, cb_plane, TILE_CHROMA_W, TILE_CHROMA_H)) {
+            decodeUs = 0;
+            return false;
+        }
+        if (!qoi_decode_plane(cr_qoi, cr_len, cr_plane, TILE_CHROMA_W, TILE_CHROMA_H)) {
+            decodeUs = 0;
+            return false;
+        }
+
+        // YUV → RGB565-BE → lower half of PSRAM framebuffer
+        uint16_t* lower_dst = frameFb[writeSet] + (TILE_H * SCREEN_W);
+        yuv420_to_rgb565_simd(y_plane, cb_plane, cr_plane,
+                              lower_dst,
+                              SCREEN_W, TILE_H);
+    }
 
     decodeUs = micros() - t0;
     return true;
@@ -553,7 +611,7 @@ void setup() {
         xSemaphoreGive(slotFree[s]);
     }
 
-    Serial.printf("[MEM] decodeTemp       : %u B SRAM (16-byte aligned)\n", DECODE_TEMP_SIZE);
+    Serial.printf("[MEM] decodeTemp       : %u B SRAM (16-byte aligned, one tile)\n", DECODE_TEMP_SIZE);
     for (int s = 0; s < NUM_SLOTS; s++)
         Serial.printf("[MEM] slot[%d].assembly : %u B PSRAM\n", s, MAX_FRAME_QOI);
     Serial.printf("[MEM] PSRAM slots total : %u B (%d x %u)\n",
@@ -569,7 +627,7 @@ void setup() {
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM)  / 1024,
         heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
 
-    statusLine(2, "Buffers:", "QOI/YUV PSRAM", TFT_GREEN);
+    statusLine(2, "Buffers:", "QOI/Tiles PSRAM", TFT_GREEN);
 
     // ── WiFi ──────────────────────────────────────────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
@@ -589,7 +647,7 @@ void setup() {
     char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
     statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
     statusLine(4, "UDP:",    String(UDP_PORT).c_str(), TFT_CYAN);
-    statusLine(5, "Mode:",   "QOI/YUV420",             TFT_CYAN);
+    statusLine(5, "Mode:",   "QOI/Tiles",             TFT_CYAN);
     statusLine(6, "Status:", "Waiting for PC...",       TFT_YELLOW);
     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
 

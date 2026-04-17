@@ -17,7 +17,7 @@ PORT         = 12345
 ESP_W, ESP_H = 320, 240
 
 CHUNK_DATA_SIZE  = 1400
-MAX_FRAME_QOI    = 200 * 1024   # must match main.cpp
+MAX_FRAME_QOI    = 128 * 1024   # must match main.cpp (128KB for two tiles)
 
 WINDOW_NAME          = "ESP32-S3 Stream [320x240] QOI/YUV"
 UI_W, UI_H           = 480, 580
@@ -169,35 +169,45 @@ def qoi_encode_plane(plane: np.ndarray) -> bytes:
 
 
 # ─────────────────────────────────────────────
-#  FRAME ENCODER  (RGB888 → YCbCr-4:2:0 → QOI × 3 → packed frame)
+#  FRAME ENCODER  (RGB888 → YCbCr-4:2:0 → QOI × 3 per tile → packed tiles)
 # ─────────────────────────────────────────────
 def encode_frame(frame_bgr: np.ndarray) -> bytes:
     """
     frame_bgr : 320×240 BGR uint8 numpy array
-    Returns packed bytes:
-        [ySzHi ySzLo | Y-QOI | cbSzHi cbSzLo | Cb-QOI | crSzHi crSzLo | Cr-QOI]
+    Returns packed bytes for two tiles (upper + lower):
+        [tile0: ySzHi ySzLo | Y-QOI | cbSzHi cbSzLo | Cb-QOI | crSzHi crSzLo | Cr-QOI]
+        [tile1: same for lower half]
     """
-    # BGR → YCrCb  (OpenCV YCrCb = Y, Cr, Cb order; we need Y, Cb, Cr)
-    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
-    Y  = ycrcb[:, :, 0]          # 320×240
-    Cr = ycrcb[:, :, 1]          # 320×240
-    Cb = ycrcb[:, :, 2]          # 320×240
+    # Split into upper and lower tiles
+    upper = frame_bgr[:120, :]  # 320×120
+    lower = frame_bgr[120:, :]  # 320×120
 
-    # 4:2:0 downsample Cb and Cr
-    Cb2 = cv2.resize(Cb, (ESP_W // 2, ESP_H // 2), interpolation=cv2.INTER_AREA)
-    Cr2 = cv2.resize(Cr, (ESP_W // 2, ESP_H // 2), interpolation=cv2.INTER_AREA)
+    def encode_tile(tile_bgr):
+        # BGR → YCrCb
+        ycrcb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2YCrCb)
+        Y  = ycrcb[:, :, 0]          # 320×120
+        Cr = ycrcb[:, :, 1]          # 320×120
+        Cb = ycrcb[:, :, 2]          # 320×120
 
-    y_qoi  = qoi_encode_plane(Y)
-    cb_qoi = qoi_encode_plane(Cb2)
-    cr_qoi = qoi_encode_plane(Cr2)
+        # 4:2:0 downsample Cb and Cr (160×60)
+        Cb2 = cv2.resize(Cb, (160, 60), interpolation=cv2.INTER_AREA)
+        Cr2 = cv2.resize(Cr, (160, 60), interpolation=cv2.INTER_AREA)
 
-    # Pack: [szHi szLo | data] × 3
-    packed = (
-        struct.pack('>H', len(y_qoi))  + y_qoi  +
-        struct.pack('>H', len(cb_qoi)) + cb_qoi +
-        struct.pack('>H', len(cr_qoi)) + cr_qoi
-    )
-    return packed
+        y_qoi  = qoi_encode_plane(Y)
+        cb_qoi = qoi_encode_plane(Cb2)
+        cr_qoi = qoi_encode_plane(Cr2)
+
+        # Pack: [szHi szLo | data] × 3
+        return (
+            struct.pack('>H', len(y_qoi))  + y_qoi  +
+            struct.pack('>H', len(cb_qoi)) + cb_qoi +
+            struct.pack('>H', len(cr_qoi)) + cr_qoi
+        )
+
+    tile0_packed = encode_tile(upper)
+    tile1_packed = encode_tile(lower)
+
+    return tile0_packed + tile1_packed
 
 
 # ─────────────────────────────────────────────
@@ -377,6 +387,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
 
             last_frame_bytes = send_frame(sock, target_ip, packed, pacing_s=pacing_s)
 
+            num_pkts = (last_frame_bytes + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE if last_frame_bytes else 0
+
             # Preview
             preview = cv2.resize(resized, (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
             f = latest_esp_stats
@@ -409,11 +421,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
                 for text, color in dashboard:
                     cv2.putText(preview, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 1)
                     y += 22
-                num_pkts = (last_frame_bytes + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE if last_frame_bytes else 0
-                info = (f"QOI/YUV420  Frame:{last_frame_bytes}B  {num_pkts}pkts  "
+                info = (f"QOI/Tiles  Frame:{last_frame_bytes}B  {num_pkts}pkts  "
                         f"Pace:{pacing_s * 1000:.1f}ms")
-                cv2.putText(preview, info, (10, PREVIEW_H - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
             cv2.imshow(WINDOW_NAME, preview)
 
