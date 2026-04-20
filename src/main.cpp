@@ -624,6 +624,11 @@ void setup() {
         delay(250); tick++;
         char buf[24]; snprintf(buf, sizeof(buf), "Conn%.*s", tick % 5, ".....");
         statusLine(3, "WiFi:", buf, TFT_YELLOW);
+        if (millis() - ws > 200000) {
+            statusLine(3, "WiFi:", "TIMEOUT!", TFT_RED);
+            delay(3000); ESP.restart();
+        }
+    }
     esp_wifi_set_ps(WIFI_PS_NONE);
     String ip = WiFi.localIP().toString();
     char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
