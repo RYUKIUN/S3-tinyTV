@@ -49,6 +49,7 @@
 #include <JPEGDEC.h>
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <esp_wifi.h>
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
@@ -202,6 +203,19 @@ static bool     g_remoteAddrValid = false;
 static float    stat_jitter       = 0.0f;  // Core 1 writes, Core 0 reads — float OK
 static uint32_t stat_prevMs       = 0;
 
+// ── WiFi watchdog & RSSI display ─────────────────────────────────────────
+// Pre-streaming: wifiWatchdogTask monitors connection and updates row 3.
+// While connected but not yet streaming: RSSI is polled every 250 ms.
+static volatile bool g_streaming   = false;   // set true by loop() on first decoded tile
+static volatile bool g_wifiOk      = false;   // mirrors WiFi.status() == WL_CONNECTED
+
+// ── Streaming timeout overlay ─────────────────────────────────────────────
+// After entering streaming, if no packet arrives for PKT_TIMEOUT_MS the
+// displayTask draws a flashing overlay on top of the frozen frame.
+#define PKT_TIMEOUT_MS   3000   // 3 s silence → "loose connection" overlay
+#define OVERLAY_FLASH_MS 1000   // 1 s flash period (white ↔ red)
+static volatile uint32_t g_lastPktMs = 0;     // written by networkTask on every valid packet
+
 // ─────────────────────────────────────────────
 //  TILE HELPERS
 // ─────────────────────────────────────────────
@@ -321,6 +335,120 @@ static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     decodeUs = micros() - t0;
     return true;
 }
+// Forward declaration — statusLine is defined in the DISPLAY HELPERS section below
+static void statusLine(uint8_t row, const char* label, const char* value, uint32_t col = TFT_WHITE);
+
+// ─────────────────────────────────────────────
+//  OTA TASK  (Core 0, priority 1)
+// ─────────────────────────────────────────────
+// Runs alongside networkTask / displayTask on Core 0.
+// Calls ArduinoOTA.handle() every 10 ms — low enough overhead that it never
+// starves the priority-3 networkTask or priority-2 displayTask.
+// Stack: 8192 bytes (ArduinoOTA does TLS-like operations during the transfer).
+// To protect uploads set ArduinoOTA.setPassword() here and add
+//   upload_flags = --auth=<password>  to platformio.ini.
+static void otaTask(void* /*pv*/) {
+    ArduinoOTA.setHostname("esp32s3-display");
+    // ArduinoOTA.setPassword("yourpassword");   // ← uncomment to require auth
+
+    ArduinoOTA.onStart([]() {
+        String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+        Serial.printf("[OTA] Start: %s\n", type.c_str());
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("[OTA] Done — rebooting");
+    });
+    ArduinoOTA.onProgress([](unsigned int prog, unsigned int total) {
+        Serial.printf("[OTA] %u%%\r", (prog * 100) / total);
+    });
+    ArduinoOTA.onError([](ota_error_t err) {
+        const char* reason = "unknown";
+        if      (err == OTA_AUTH_ERROR)    reason = "auth failed";
+        else if (err == OTA_BEGIN_ERROR)   reason = "begin failed";
+        else if (err == OTA_CONNECT_ERROR) reason = "connect failed";
+        else if (err == OTA_RECEIVE_ERROR) reason = "receive failed";
+        else if (err == OTA_END_ERROR)     reason = "end failed";
+        Serial.printf("[OTA] Error[%u]: %s\n", err, reason);
+    });
+
+    ArduinoOTA.begin();
+    Serial.printf("[OTA] Ready — hostname: esp32s3-display  IP: %s\n",
+                  WiFi.localIP().toString().c_str());
+
+    for (;;) {
+        ArduinoOTA.handle();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ─────────────────────────────────────────────
+//  WIFI WATCHDOG TASK  (Core 0, priority 1)
+// ─────────────────────────────────────────────
+// Runs from the moment setup() finishes (after initial connect).
+// Responsibilities:
+//   • While NOT streaming: polls WiFi every 250 ms.
+//     - Connected   → show RSSI on row 3 ("WiFi: <ip> (<rssi>dBm)")
+//     - Disconnected → update row 3 to "Connecting...", attempt reconnect,
+//                      update g_wifiOk so networkTask knows socket is usable.
+//   • While streaming: exits the RSSI loop (display is owned by displayTask)
+//     but still keeps g_wifiOk current so networkTask can react if needed.
+static void wifiWatchdogTask(void*) {
+    // Animated dots counter reused for reconnect phase
+    uint8_t tick = 0;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+
+        bool connected = (WiFi.status() == WL_CONNECTED);
+        g_wifiOk = connected;
+
+        if (g_streaming) {
+            // Display is owned by the streaming pipeline — do nothing to it.
+            // Just keep g_wifiOk accurate; network reconnect is not attempted
+            // here because the streaming-timeout overlay handles UX.
+            continue;
+        }
+
+        if (connected) {
+            // Connected, not yet streaming — refresh RSSI every 250 ms
+            int32_t rssi = WiFi.RSSI();
+            String  ip   = WiFi.localIP().toString();
+            char    buf[40];
+            snprintf(buf, sizeof(buf), "%s (%ddBm)", ip.c_str(), (int)rssi);
+            statusLine(3, "WiFi:", buf, TFT_GREEN);
+        } else {
+            // Lost WiFi — update display immediately, then attempt reconnect
+            char animBuf[24];
+            snprintf(animBuf, sizeof(animBuf), "Connecting%.*s", tick % 4, "....");
+            statusLine(3, "WiFi:", animBuf, TFT_YELLOW);
+            tick++;
+
+            WiFi.disconnect(true);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+            // Wait up to ~10 s for reconnect, animating the dots
+            uint32_t ws = millis();
+            while (WiFi.status() != WL_CONNECTED && (millis() - ws) < 10000) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                snprintf(animBuf, sizeof(animBuf), "Connecting%.*s", tick % 4, "....");
+                statusLine(3, "WiFi:", animBuf, TFT_YELLOW);
+                tick++;
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                g_wifiOk = true;
+                esp_wifi_set_ps(WIFI_PS_NONE);
+                int32_t rssi = WiFi.RSSI();
+                String  ip   = WiFi.localIP().toString();
+                char    buf[40];
+                snprintf(buf, sizeof(buf), "%s (%ddBm)", ip.c_str(), (int)rssi);
+                statusLine(3, "WiFi:", buf, TFT_GREEN);
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────
 //  NETWORK TASK  (Core 0)
 // ─────────────────────────────────────────────
@@ -380,6 +508,7 @@ static IRAM_ATTR void networkTask(void*) {
         }
 
         lastPktMs = millis(); pktCount++;
+        g_lastPktMs = lastPktMs;   // shared with displayTask for streaming timeout
         if (n < 4 || rxBuf[0] != 0xAA) { portYIELD(); continue; }
         memcpy(&g_remoteAddr, &sender, sizeof(sender));
         g_remoteAddrValid = true;
@@ -434,7 +563,7 @@ static IRAM_ATTR void networkTask(void*) {
             resetTile(tId);
         }
 
-        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 500) {
+        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 400) {
             uint32_t el = millis() - lastStatMs;
 
             static uint32_t lastPresented = 0;
@@ -484,7 +613,7 @@ static IRAM_ATTR void networkTask(void*) {
 //  DISPLAY HELPERS
 // ─────────────────────────────────────────────
 static void statusLine(uint8_t row, const char* label, const char* value,
-                       uint32_t col = TFT_WHITE) {
+                       uint32_t col) {
     int y = 58 + row * 22;
     lcd.fillRect(0, y, SCREEN_W, 22, TFT_BLACK);
     lcd.setTextColor(0x7BEF, TFT_BLACK); lcd.drawString(label, 8,   y + 3);
@@ -509,12 +638,69 @@ static void drawBootHeader() {
 // networkTask always preempts displayTask on UDP packet arrival.
 // depth-2 displayQueue means Core 1 never blocks even if Core 0 is mid-push.
 // Single pushImage covers the full 320×240 frame atomically — no tile seam.
+//
+// Streaming-timeout overlay:
+//   After the first packet arrives (g_streaming=true), if g_lastPktMs hasn't
+//   been updated for PKT_TIMEOUT_MS the task draws a flashing text overlay
+//   directly on the LCD ("LOOSE CONNECTION / ATTEMPT TO CONNECT BACK").
+//   The overlay flashes between white and red every OVERLAY_FLASH_MS.
+//   It respects the display rotation set in setup() (setRotation(1) = landscape,
+//   origin top-left of the *rotated* frame, so X=0..319 left-right,
+//   Y=0..239 top-bottom).  The overlay is drawn at the top-left corner.
+//   When packets resume, the overlay disappears on the next pushImage.
 static void displayTask(void*) {
     DisplayMsg dmsg;
+    bool    overlayVisible  = false;
+    bool    overlayPhase    = false;   // false=white, true=red
+    uint32_t lastFlipMs     = 0;
+
     while (true) {
-        if (xQueueReceive(displayQueue, &dmsg, portMAX_DELAY) != pdTRUE) continue;
-        lcd.pushImage(0, 0, SCREEN_W, SCREEN_H, frameFb[dmsg.bufSet]);
-        g_presentedFrames++;
+        // ── Try to receive a new frame (100 ms timeout so we can still draw overlay) ──
+        bool gotFrame = (xQueueReceive(displayQueue, &dmsg, pdMS_TO_TICKS(100)) == pdTRUE);
+
+        if (gotFrame) {
+            lcd.pushImage(0, 0, SCREEN_W, SCREEN_H, frameFb[dmsg.bufSet]);
+            g_presentedFrames++;
+        }
+
+        // ── Streaming-timeout overlay ─────────────────────────────────────
+        if (!g_streaming) { overlayVisible = false; continue; }
+
+        uint32_t now      = millis();
+        uint32_t silence  = now - g_lastPktMs;
+        bool     timedOut = (silence >= PKT_TIMEOUT_MS);
+
+        if (!timedOut) {
+            // Packets flowing normally — clear overlay flag; no extra draw needed
+            // (the pushImage above already painted the fresh frame).
+            overlayVisible = false;
+            continue;
+        }
+
+        // No packet for >= 3 s → draw / refresh the flashing overlay
+        // Flip phase every OVERLAY_FLASH_MS
+        if (!overlayVisible || (now - lastFlipMs) >= OVERLAY_FLASH_MS) {
+            overlayPhase = !overlayPhase;
+            lastFlipMs   = now;
+            overlayVisible = true;
+
+            // ── Overlay geometry (accounts for rotation=1: 320 wide × 240 tall) ──
+            // Two lines of text, top-left corner, semi-transparent filled rect behind.
+            const int OX = 4;    // left margin (rotated X)
+            const int OY = 4;    // top margin  (rotated Y)
+            const int OW = 236;  // overlay box width  (fits in 320-px wide rotated frame)
+            const int OH = 38;   // overlay box height (two rows of font2 ~16px each)
+
+            uint32_t bgColor   = 0x2000;  // dark red background
+            uint32_t textColor = overlayPhase ? TFT_WHITE : TFT_RED;
+
+            lcd.fillRect(OX, OY, OW, OH, bgColor);
+            lcd.setTextFont(2);
+            lcd.setTextSize(1);
+            lcd.setTextColor(textColor, bgColor);
+            lcd.drawString("LOOSE CONNECTION",           OX + 4, OY + 3);
+            lcd.drawString("ATTEMPT TO CONNECT BACK...", OX + 4, OY + 20);
+        }
     }
 }
 
@@ -619,10 +805,15 @@ void setup() {
     // ── WiFi ──────────────────────────────────────────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
     WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
+    
+    // Force 802.11n HT40 for maximum throughput in clean, short-range environment
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+    
     uint32_t ws = millis(); uint8_t tick = 0;
     while (WiFi.status() != WL_CONNECTED) {
         delay(250); tick++;
-        char buf[24]; snprintf(buf, sizeof(buf), "Conn%.*s", tick % 5, ".....");
+        char buf[24]; snprintf(buf, sizeof(buf), "Connecting%.*s", tick % 4, "....");
         statusLine(3, "WiFi:", buf, TFT_YELLOW);
         if (millis() - ws > 200000) {
             statusLine(3, "WiFi:", "TIMEOUT!", TFT_RED);
@@ -630,17 +821,25 @@ void setup() {
         }
     }
     esp_wifi_set_ps(WIFI_PS_NONE);
+    g_wifiOk = true;
     String ip = WiFi.localIP().toString();
     char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
     statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
-    statusLine(4, "Mode:",   "Wireless display",       TFT_CYAN);
-    statusLine(5, "Status:", "Waiting for PC...",       TFT_YELLOW);
+    statusLine(5, "Mode:",   "Wireless display",       TFT_CYAN);
+    statusLine(6, "Status:", "Waiting for PC...",       TFT_YELLOW);
     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
+
+    // ── OTA ──────────────────────────────────────────────────────────────────
+    // Must start after WiFi is up. Priority 1 = lowest; never preempts net/display.
+    xTaskCreatePinnedToCore(otaTask, "OTA", 8192, NULL, 1, NULL, 0);
+    statusLine(4, "OTA:", "Ready (esp32s3-display)", TFT_CYAN);
 
     // networkTask: priority 3, always preempts displayTask for UDP responsiveness
     // displayTask: priority 2, fills Core 0 idle gaps between UDP bursts
-    xTaskCreatePinnedToCore(networkTask, "NetTask",  10240, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(displayTask, "DispTask", 4096,  NULL, 2, NULL, 0);
+    // wifiWatchdogTask: priority 1, lowest — RSSI refresh and reconnect on drop
+    xTaskCreatePinnedToCore(networkTask,      "NetTask",   10240, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(displayTask,      "DispTask",  4096,  NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(wifiWatchdogTask, "WiFiWatch", 3072,  NULL, 1, NULL, 0);
     Serial.println("[OK] Ready.");
 }
 
@@ -696,6 +895,8 @@ void loop() {
 
         if (!streamStarted) {
             streamStarted = true;
+            g_streaming   = true;
+            g_lastPktMs   = millis();   // baseline so overlay doesn't fire immediately
             statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
             // ลบ Serial.printf ของ First Tile ออก และคง delay ไว้ให้จออัปเดตทัน
             delay(200); 
