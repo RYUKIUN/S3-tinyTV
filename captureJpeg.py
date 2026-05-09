@@ -43,6 +43,7 @@ DEBUG_SEND_INTERVAL_S = 0.5
 
 # Diagnostic thresholds
 DIAG_FPS_WARN,  DIAG_FPS_ERR   =  20,    15
+DIAG_JIT_WARN, DIAG_JIT_ERR = 5.0, 10.0
 DIAG_TEMP_WARN, DIAG_TEMP_ERR  =  70,    85
 DIAG_DEC_WARN,  DIAG_DEC_ERR   =  8000,  15000
 DIAG_DROP_WARN, DIAG_DROP_ERR  =  1,     5
@@ -306,6 +307,7 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
                 dashboard = [
                     (f"FPS  : {latest_esp_stats.get('FPS', '?'):>8}", _diag_color(latest_esp_stats.get('FPS', '0'), 20, 15, True)),
                     (f"TEMP : {latest_esp_stats.get('TEMP', '?'):>7} C", _diag_color(latest_esp_stats.get('TEMP', '0'), 70, 85)),
+                    (f"JIT  : {latest_esp_stats.get('JIT', '?'):>7} ms", _diag_color(latest_esp_stats.get('JIT', '0'), DIAG_JIT_WARN, DIAG_JIT_ERR)),
                     (f"DEC  : {latest_esp_stats.get('DEC', '?'):>7} us", _diag_color(latest_esp_stats.get('DEC', '0'), 8000, 15000)),
                     (f"DROP : {latest_esp_stats.get('DROP', '?'):>8}", _diag_color(latest_esp_stats.get('DROP', '0'), 1, 5)),
                     (f"RAW  : {last_frame_bytes:>8} B", size_col),
@@ -348,3 +350,4 @@ if __name__ == "__main__":
             stream_mss_udp(addr[0], *select_monitor())
     except: print("[ERROR] No ESP found.")
     finally: s_disc.close(); reset_resolution_timer()
+    
