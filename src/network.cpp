@@ -2,6 +2,9 @@
 #include "display.h"
 #include <WiFi.h>
 
+// Extern declarations for global variables
+extern volatile uint32_t g_wifiDisconnectedMs;
+
 static IRAM_ATTR void resetTile(uint8_t t) {
     memset(tiles[t].chunkGot, 0, sizeof(tiles[t].chunkGot));
     tiles[t].frameId      = 0xFF;
@@ -56,6 +59,16 @@ void networkTask(void*) {
     uint8_t back = 0;
 
     while (true) {
+        // ── Offline-mode shutdown ─────────────────────────────────────────────
+        // enterOfflineMode() sets g_offlineMode then closes g_sock.
+        // We may still be in recvfrom / select; check here on each wakeup.
+        if (g_offlineMode) {
+            if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+            Serial.println("[NET] Offline mode — networkTask exiting");
+            vTaskDelete(NULL);
+            return;
+        }
+
         int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
                          (struct sockaddr*)&sender, &slen);
 
@@ -183,15 +196,23 @@ void networkTask(void*) {
 
 void wifiWatchdogTask(void*) {
     uint8_t tick = 0;
-    uint32_t lastReconnectMs = 0;
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(250));
 
+        // ── Offline-mode shutdown ─────────────────────────────────────────────
+        if (g_offlineMode) {
+            Serial.println("[WATCHDOG] Offline mode — wifiWatchdogTask exiting");
+            vTaskDelete(NULL);
+            return;
+        }
+
         bool connected = (WiFi.status() == WL_CONNECTED);
         g_wifiOk = connected;
 
-        if (connected) {
+        if (connected) {            if (g_wifiDisconnectedMs == 0) {
+                g_wifiDisconnectedMs = millis();
+            }            g_wifiDisconnectedMs = 0;  // reset disconnect timer
             if (!g_streaming) {
                 int32_t rssi = WiFi.RSSI();
                 String  ip   = WiFi.localIP().toString();
@@ -232,6 +253,8 @@ void wifiWatchdogTask(void*) {
             continue;
         }
 
+        // Streaming was active, WiFi dropped — reconnect in background
+        static uint32_t lastReconnectMs = 0;
         if (millis() - lastReconnectMs >= 3000) {
             lastReconnectMs = millis();
             WiFi.disconnect(true);

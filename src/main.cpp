@@ -16,32 +16,25 @@
  *    chunkStorage[4]   PSRAM 134 KB    chunk staging; network writes, not decode-critical
  *
  *  Total SRAM for buffers: ~104 KB
- *  Key gains:
- *    • JPEGDEC MCU scatter-writes hit L1 SRAM cache (was 1200× PSRAM writes).
- *    • bswap16_memcpy_simd() combines LE→BE conversion and SRAM→PSRAM copy
- *      in one pass using 4 PIE Q-registers (32 px/iter).
- *      Eliminates a full 38 KB SRAM re-read vs the old separate bswap+memcpy.
- *    • Single lcd.pushImage(0,0,320,240) per frame eliminates per-tile seam
- *      artifacts that appear at high FPS when tile pushes straddle frame boundaries.
  *
- *  Pipeline (steady state):
+ * OFFLINE MODE
+ * ────────────
+ *  Trigger: WiFi connected but no stream packet received within OFFLINE_TRIGGER_MS (5 s).
+ *           OR: WiFi fails to associate within WIFI_CONNECT_TIMEOUT_MS (15 s).
  *
- *    Core 0 (net)                    Core 1 (render)
- *    ─────────────                   ───────────────
- *    assemble → slot[back].assembly (SRAM, 16-byte aligned)
- *    post decodeQueue ───────────────→ take decodeQueue
- *    back ^= 1                         decode → decodeTemp (SRAM, LE)
- *    take slotFree[back]               bswap16_memcpy_simd(row-stride → frameFb)
- *    assemble → slot[back].assembly    └─ PIE EE inline asm, 32 px/iter, combined
- *    post decodeQueue ←──────────────  post DisplayMsg → displayQueue
- *                                       give slotFree[s]
- *    ...
+ *  Behaviour:
+ *   1. enterOfflineMode() — sets g_offlineMode, tears down WiFi, drops CPU to 80 MHz.
+ *   2. All streaming tasks (networkTask, wifiWatchdogTask, displayTask, otaTask) see
+ *      g_offlineMode on their next iteration and call vTaskDelete(NULL).
+ *   3. 500 ms grace period for tasks to exit before LCD is claimed by the player.
+ *   4. runOfflinePlayer() — called from Arduino loop() (Core 1); loops forever.
+ *      Scans SPIFFS for .mjpeg files, plays them in sequence, cycles on end.
  *
- *  Stats packet (0xAB 0xCD prefix, sent every second when debugEnabled):
- *    FPS:X.X|TEMP:XX.X|JIT:X.X|DEC:XXXX|DROP:X|ABRT:X|SRAM:XXXX/XXXX|PSRAM:XXXX/XXXX
- *    DEC  = avg tile decode time in µs (JPEG + bswap_memcpy, NOT pushImage)
- *    DROP = corrupt + timeout count in this 1-second window
- *    ABRT = partial frames dropped due to frameId switch (UDP reorder/overrun)
+ *  Power savings in offline mode:
+ *   • WiFi radio completely off  (WiFi.mode(WIFI_OFF) + esp_wifi_stop())
+ *   • CPU frequency 240 → 80 MHz
+ *   • No FreeRTOS tasks except the idle task and loop() itself
+ *   • vTaskDelay() used for frame pacing — Core idle between frames
  */
 
 #define LGFX_USE_V1
@@ -53,6 +46,7 @@
 #include <esp_wifi.h>
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
+#include <SPIFFS.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -61,295 +55,78 @@
 #include <lwip/netdb.h>
 #include <fcntl.h>
 #include <math.h>
+#include "shared.h"
+#include "display.h"
+#include "network.h"
+#include "jpeg_decode.h"
+#include "offline_player.h"
 
 
 // ─────────────────────────────────────────────
-//  DISPLAY
-// ─────────────────────────────────────────────
-class LGFX : public lgfx::LGFX_Device {
-    lgfx::Bus_Parallel8  _bus;
-    lgfx::Panel_ILI9341  _panel;
-public:
-    LGFX() {
-        { auto cfg = _bus.config();
-          cfg.freq_write = 30000000;
-          cfg.pin_wr = 1; cfg.pin_rd = 40; cfg.pin_rs = 2;
-          cfg.pin_d0 = 5; cfg.pin_d1 = 4;  cfg.pin_d2 = 10;
-          cfg.pin_d3 = 9; cfg.pin_d4 = 3;  cfg.pin_d5 = 8;
-          cfg.pin_d6 = 7; cfg.pin_d7 = 6;
-          _bus.config(cfg); _panel.setBus(&_bus); }
-        { auto cfg = _panel.config();
-          cfg.pin_cs = 41; cfg.pin_rst = 39; cfg.pin_busy = -1;
-          cfg.panel_width = 240; cfg.panel_height = 320;
-          cfg.offset_x = 0; cfg.offset_y = 0; cfg.offset_rotation = 0;
-          cfg.dummy_read_pixel = 8;
-          cfg.readable = false; cfg.invert = false;
-          cfg.rgb_order = false; cfg.dlen_16bit = false; cfg.bus_shared = false;
-          _panel.config(cfg); }
-        setPanel(&_panel);
-    }
-};
-static LGFX lcd;
-
-// ─────────────────────────────────────────────
-//  CONFIG
+//  CONFIG DEFINITIONS
 // ─────────────────────────────────────────────
 const char* WIFI_SSID  = "Endmin";
 const char* WIFI_PASS  = "987654321";
-const int   UDP_PORT   = 12345;
-
-#define SCREEN_W         320
-#define SCREEN_H         240
-#define NUM_TILES        4
-#define TILE_W           160
-#define TILE_H           120
-#define TILE_PIXELS      (TILE_W * TILE_H)          // 19 200
-#define CHUNK_DATA_SIZE  1400
-#define MAX_TILE_CHUNKS  24          // 24 x 1400 = 33.6 KB max JPEG per tile
-#define MAX_TILE_JPEG    (MAX_TILE_CHUNKS * CHUNK_DATA_SIZE)
-#define TILE_TIMEOUT_MS  200
-
-// Screen position of each tile: TL TR BL BR
-static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
-static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 
 // ─────────────────────────────────────────────
-//  PIPELINE SLOTS  (4 shared decode/display buffers)
+//  PIPELINE SLOTS DEFINITIONS
 // ─────────────────────────────────────────────
-// Increased from 2 to 4 so networkTask can post all 4 tile messages to
-// decodeQueue without blocking, eliminating the UDP dead-zone that caused
-// rising ABRT rates at higher JPEG quality.
-#define NUM_SLOTS 4
-struct PipeSlot {
-    uint8_t* assembly;   // SRAM — JPEGDEC reads here; single-cycle access critical
-};
-static PipeSlot slot[NUM_SLOTS];
+PipeSlot slot[NUM_SLOTS];
 
 // SRAM scratch for Core-1 decode.
-// JPEGDEC scatter-writes LE pixels here; bswap16_memcpy_simd() reads once,
-// byte-swaps, and writes BE directly to frameFb in PSRAM.
-// Core-1 exclusive — no synchronisation needed.
-static uint16_t* decodeTemp = nullptr;
+uint16_t* decodeTemp = nullptr;
 
-// Double-buffered full-frame framebuffers in PSRAM (320×240×2 = 150 KB each).
-// Core 1 (decoder) blits each decoded tile into the correct XY region of
-// frameFb[writeSet] using row-stride copies, so the full frame is always
-// contiguous in memory. displayTask pushes one atomic lcd.pushImage per frame,
-// eliminating the per-tile seam artifact that appears at high FPS.
-// writeSet is flipped after posting to displayQueue so both halves are
-// never accessed simultaneously.
-static uint16_t* frameFb[2] = { nullptr, nullptr };
-static uint8_t writeSet = 0;  // Core 1 exclusive — no sync needed
-
-// Message passed through the decode queue
-struct DecodeMsg {
-    uint8_t  frameId;   // frame sequence (0-255) for frame-sync presentation
-    uint8_t  tId;       // which tile position (0-3) -> determines screen XY
-    uint8_t  slotIdx;   // which PipeSlot holds the assembled JPEG
-    uint16_t len;       // JPEG byte count in slot[slotIdx].assembly
-};
+// Double-buffered full-frame framebuffers in PSRAM.
+uint16_t* frameFb[2] = { nullptr, nullptr };
+uint8_t writeSet = 0;  // Core 1 exclusive — no sync needed
 
 // Pipeline synchronisation
-// decodeQueue depth matches NUM_SLOTS (4): networkTask can post all 4 tile
-// messages back-to-back and return to recvfrom immediately, with no blocking
-// on xQueueSend. Core 1 drains the queue at its own pace.
-static QueueHandle_t     decodeQueue;                // depth-4 queue: net -> renderer
-static SemaphoreHandle_t slotFree[NUM_SLOTS];        // given when renderer finishes slot
+QueueHandle_t     decodeQueue;                // depth-4 queue: net -> renderer
+SemaphoreHandle_t slotFree[NUM_SLOTS];        // given when renderer finishes slot
 
 // Display pipeline: Core 1 posts here when all 4 tiles are ready.
-// Display task (separate) does the blocking pushImage calls.
-struct DisplayMsg {
-    uint8_t frameId;   // for stats / debug
-    uint8_t bufSet;    // which frameFb[bufSet] to push (0 or 1)
-};
-static QueueHandle_t displayQueue;      // depth-2 queue: renderer -> display task (Core 0)
+QueueHandle_t displayQueue;      // depth-2 queue: renderer -> display task (Core 0)
 
 // ─────────────────────────────────────────────
-//  CHUNK REASSEMBLY STATE  (one per tile position)
+//  CHUNK REASSEMBLY STATE DEFINITIONS
 // ─────────────────────────────────────────────
-struct TileState {
-    uint8_t* chunkBuf[MAX_TILE_CHUNKS]; // -> PSRAM chunkStorage slab
-    uint16_t chunkLen[MAX_TILE_CHUNKS];
-    bool     chunkGot[MAX_TILE_CHUNKS];
-    uint8_t  frameId      = 0xFF;
-    uint8_t  totalChunks  = 0;
-    uint16_t frameSize    = 0;
-    uint8_t  chunksGot    = 0;
-    uint32_t firstChunkMs = 0;
-    // Stats — written by Core 0, reset by Core 0 after each stat window
-    uint32_t stat_decoded = 0;
-    uint32_t stat_corrupt = 0;
-    uint32_t stat_timeout = 0;
-};
-static TileState tiles[NUM_TILES];
-static uint8_t*  tileChunkStorage[NUM_TILES] = {};
+TileState tiles[NUM_TILES];
+uint8_t*  tileChunkStorage[NUM_TILES] = {};
 
 // ─────────────────────────────────────────────
-//  CROSS-CORE STATS  (Core 1 writes, Core 0 reads for UDP report)
-//  32-bit aligned -> single-instruction read/write on LX7, no tearing.
+//  CROSS-CORE STATS DEFINITIONS
 // ─────────────────────────────────────────────
-static volatile uint32_t g_avgDecodeUs     = 0;  // avg tile decode us (excl. pushImage)
-static volatile uint32_t g_presentedFrames = 0;  // frames fully pushed to LCD
-static volatile uint32_t g_abortedFrames   = 0;  // partial frames dropped (UDP reorder)
-
-// ─────────────────────────────────────────────
-//  GLOBAL STATE
-// ─────────────────────────────────────────────
-static bool     debugEnabled      = false;
-static char     debugBuf[256];
-static int      g_sock            = -1;
-static struct   sockaddr_in g_remoteAddr;
-static bool     g_remoteAddrValid = false;
-static float    stat_jitter       = 0.0f;  // Core 1 writes, Core 0 reads — float OK
-static uint32_t stat_prevMs       = 0;
-
-// ── WiFi watchdog & RSSI display ─────────────────────────────────────────
-// Pre-streaming: wifiWatchdogTask monitors connection and updates row 3.
-// While connected but not yet streaming: RSSI is polled every 250 ms.
-static volatile bool g_streaming   = false;   // set true by loop() on first decoded tile
-static volatile bool g_wifiOk      = false;   // mirrors WiFi.status() == WL_CONNECTED
-
-// ── Streaming timeout overlay ─────────────────────────────────────────────
-// After entering streaming, if no packet arrives for PKT_TIMEOUT_MS the
-// displayTask draws a flashing overlay on top of the frozen frame.
-#define PKT_TIMEOUT_MS   3000   // 3 s silence → "loose connection" overlay
-#define OVERLAY_FLASH_MS 1000   // 1 s flash period (white ↔ red)
-static volatile uint32_t g_lastPktMs = 0;     // written by networkTask on every valid packet
+volatile uint32_t g_avgDecodeUs     = 0;  // avg tile decode us (excl. pushImage)
+volatile uint32_t g_presentedFrames = 0;  // frames fully pushed to LCD
+volatile uint32_t g_abortedFrames   = 0;  // partial frames dropped (UDP reorder)
 
 // ─────────────────────────────────────────────
-//  TILE HELPERS
+//  GLOBAL STATE DEFINITIONS
 // ─────────────────────────────────────────────
-static IRAM_ATTR void resetTile(uint8_t t) {
-    memset(tiles[t].chunkGot, 0, sizeof(tiles[t].chunkGot));
-    tiles[t].frameId      = 0xFF;
-    tiles[t].totalChunks  = 0;
-    tiles[t].frameSize    = 0;
-    tiles[t].chunksGot    = 0;
-    tiles[t].firstChunkMs = 0;
-}
+bool     debugEnabled      = false;
+char     debugBuf[256];
+int      g_sock            = -1;
+struct   sockaddr_in g_remoteAddr;
+bool     g_remoteAddrValid = false;
+float    stat_jitter       = 0.0f;
+uint32_t stat_prevMs       = 0;
 
-// Assemble complete tile JPEG from chunks into dst (slot[].assembly, SRAM).
-// Returns assembled byte count, or 0 on corruption.
-static IRAM_ATTR int assembleTileInto(uint8_t t, uint8_t* dst) {
-    TileState& ts = tiles[t];
-    if (ts.totalChunks == 0) return 0;
-    int offset = 0;
-    for (uint8_t c = 0; c < ts.totalChunks; c++) {
-        if (!ts.chunkGot[c]) return 0;
-        memcpy(dst + offset, ts.chunkBuf[c], ts.chunkLen[c]);
-        offset += ts.chunkLen[c];
-    }
-    // Validate JPEG SOI / EOI markers
-    if (offset < 4 ||
-        dst[0] != 0xFF || dst[1] != 0xD8 ||
-        dst[offset-2] != 0xFF || dst[offset-1] != 0xD9) {
-        ts.stat_corrupt++;
-        return 0;
-    }
-    return offset;
-}
-// ─────────────────────────────────────────────
-//  DECODE PIPELINE
-// ─────────────────────────────────────────────
-//
-// Step 1 — JPEGDEC fires mcuCallback for each MCU block.
-//           Pixels scatter-written into decodeTemp (SRAM).
-//           RGB565_LITTLE_ENDIAN keeps JPEGDEC on its ESP32-S3 PIE assembly
-//           path (jpegimc.S) for YCbCr->RGB565 (8 px/cycle).
-//           Requesting RGB565_BIG_ENDIAN bypasses that path; jpegimc.S only
-//           outputs LE — BE mode falls back to scalar C, losing PIE entirely.
-//
-// Step 2 — bswap16_memcpy_simd() (bswap16_memcpy_simd.h) converts decodeTemp
-//           LE->BE while copying row-by-row directly into the correct XY region
-//           of frameFb[writeSet] in PSRAM (row stride = SCREEN_W).
-//           ESP32-S3: 4x EE.VLD.128.IP loads, 2x EE.VUNZIP.8, 2x EE.VZIP.8,
-//           4x EE.VST.128.IP stores per 32 pixels — one SRAM read pass total.
-//           Non-S3: scalar 32-bit fallback with bswap-during-copy.
-//
-// Step 3 — lcd.pushImage(0,0,320,240) sends the full frameFb atomically.
-//           No per-tile seam possible — display receives one continuous stream.
+// ── WiFi watchdog & RSSI display ─────────────────────────────────────────────
+volatile bool     g_streaming        = false;
+volatile bool     g_wifiOk           = false;
+volatile uint32_t g_lastPktMs        = 0;
+volatile uint32_t g_wifiConnectedMs  = 0;   // millis() when WiFi first associated
+volatile uint32_t g_wifiDisconnectedMs = 0; // millis() when WiFi last disconnected
 
-static JPEGDEC jpeg_dec;
+// ── Offline mode ──────────────────────────────────────────────────────────────
+volatile bool g_offlineMode = false;   // set by enterOfflineMode(), never cleared
 
-struct McuCtx { uint16_t* fb; };
-static McuCtx mcuCtx;
-
-// MCU callback: scatter-write LE pixels into decodeTemp (SRAM).
-static IRAM_ATTR int mcuCallback(JPEGDRAW* pDraw) {
-    uint16_t*       dst = ((McuCtx*)pDraw->pUser)->fb + pDraw->y * TILE_W + pDraw->x;
-    const uint16_t* src = (const uint16_t*)pDraw->pPixels;
-    int w = pDraw->iWidth, h = pDraw->iHeight;
-    for (int r = 0; r < h; r++)
-        memcpy(dst + r * TILE_W, src + r * w, (size_t)w * 2);
-    return 1;
-}
-
-// Combined LE->BE conversion + SRAM->PSRAM copy in one pass.
-// See bswap16_memcpy_simd.h for full implementation details.
-#include "bswap16_memcpy_simd.h"
-
-// Full decode pipeline for one slot.
-// Returns true on success; decodeUs = time for decode+bswap+copy in us (not LCD push).
-static IRAM_ATTR bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
-    PipeSlot& s = slot[msg.slotIdx];
-
-    // Early guards — cheap checks before any decode work
-    if ((uintptr_t)s.assembly & 15) {
-        decodeUs = 0;
-        return false;
-    }
-    if (msg.tId >= NUM_TILES || frameFb[writeSet] == nullptr) {
-        decodeUs = 0;
-        return false;
-    }
-
-    // ── Decode LE pixels into SRAM scratch ───────────────────────────────
-    mcuCtx.fb = decodeTemp;
-    if (!jpeg_dec.openRAM(s.assembly, msg.len, mcuCallback)) {
-        decodeUs = 0;
-        return false;
-    }
-    
-    jpeg_dec.setPixelType(RGB565_LITTLE_ENDIAN);
-    jpeg_dec.setUserPointer(&mcuCtx);
-
-    uint32_t t0 = micros();
-    int rc = jpeg_dec.decode(0, 0, 0);
-    jpeg_dec.close();
-
-    if (!rc) {
-        decodeUs = 0;
-        return false;
-    }
-
-    // ── Combined PIE bswap + SRAM->PSRAM copy, row-stride into full frameFb ─
-    uint16_t* fbBase = frameFb[writeSet]
-                     + TILE_Y[msg.tId] * SCREEN_W
-                     + TILE_X[msg.tId];
-    for (int row = 0; row < TILE_H; row++) {
-        bswap16_memcpy_simd(fbBase + row * SCREEN_W,
-                            decodeTemp + row * TILE_W,
-                            TILE_W);
-    }
-
-    decodeUs = micros() - t0;
-    return true;
-}
-// Forward declaration — statusLine is defined in the DISPLAY HELPERS section below
-static void statusLine(uint8_t row, const char* label, const char* value, uint32_t col = TFT_WHITE);
 
 // ─────────────────────────────────────────────
 //  OTA TASK  (Core 0, priority 1)
 // ─────────────────────────────────────────────
-// Runs alongside networkTask / displayTask on Core 0.
-// Calls ArduinoOTA.handle() every 10 ms — low enough overhead that it never
-// starves the priority-3 networkTask or priority-2 displayTask.
-// Stack: 8192 bytes (ArduinoOTA does TLS-like operations during the transfer).
-// To protect uploads set ArduinoOTA.setPassword() here and add
-//   upload_flags = --auth=<password>  to platformio.ini.
 static void otaTask(void* /*pv*/) {
     ArduinoOTA.setHostname("esp32s3-display");
-    // ArduinoOTA.setPassword("yourpassword");   // ← uncomment to require auth
 
     ArduinoOTA.onStart([]() {
         String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
@@ -376,333 +153,66 @@ static void otaTask(void* /*pv*/) {
                   WiFi.localIP().toString().c_str());
 
     for (;;) {
+        // Self-terminate when offline mode is active (WiFi is off, OTA is useless)
+        if (g_offlineMode) {
+            Serial.println("[OTA] Offline mode — otaTask exiting");
+            vTaskDelete(NULL);
+            return;
+        }
         ArduinoOTA.handle();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 // ─────────────────────────────────────────────
-//  WIFI WATCHDOG TASK  (Core 0, priority 1)
+//  ENTER OFFLINE MODE
+//  Can be called from setup() (no tasks running) or loop() (tasks running).
+//  Sets g_offlineMode so all tasks self-terminate, then kills WiFi and
+//  reduces the CPU frequency for power saving.
+//  After this returns, call runOfflinePlayer() (which never returns).
 // ─────────────────────────────────────────────
-// Runs from the moment setup() finishes (after initial connect).
-// Responsibilities:
-//   • While NOT streaming: polls WiFi every 250 ms.
-//     - Connected   → show RSSI on row 3 ("WiFi: <ip> (<rssi>dBm)")
-//     - Disconnected → update row 3 to "Connecting...", attempt reconnect,
-//                      update g_wifiOk so networkTask knows socket is usable.
-//   • While streaming: exits the RSSI loop (display is owned by displayTask)
-//     but still keeps g_wifiOk current so networkTask can react if needed.
-static void wifiWatchdogTask(void*) {
-    // Animated dots counter reused for reconnect phase
-    uint8_t tick = 0;
+static void enterOfflineMode() {
+    Serial.println("[OFFLINE] Entering offline mode");
 
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(250));
+    // 1. Signal all streaming tasks to stop.
+    //    They poll g_offlineMode on each iteration and call vTaskDelete(NULL).
+    g_offlineMode = true;
 
-        bool connected = (WiFi.status() == WL_CONNECTED);
-        g_wifiOk = connected;
-
-        if (g_streaming) {
-            // Display is owned by the streaming pipeline — do nothing to it.
-            // Just keep g_wifiOk accurate; network reconnect is not attempted
-            // here because the streaming-timeout overlay handles UX.
-            continue;
-        }
-
-        if (connected) {
-            // Connected, not yet streaming — refresh RSSI every 250 ms
-            int32_t rssi = WiFi.RSSI();
-            String  ip   = WiFi.localIP().toString();
-            char    buf[40];
-            snprintf(buf, sizeof(buf), "%s (%ddBm)", ip.c_str(), (int)rssi);
-            statusLine(3, "WiFi:", buf, TFT_GREEN);
-        } else {
-            // Lost WiFi — update display immediately, then attempt reconnect
-            char animBuf[24];
-            snprintf(animBuf, sizeof(animBuf), "Connecting%.*s", tick % 4, "....");
-            statusLine(3, "WiFi:", animBuf, TFT_YELLOW);
-            tick++;
-
-            WiFi.disconnect(true);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-            // Wait up to ~10 s for reconnect, animating the dots
-            uint32_t ws = millis();
-            while (WiFi.status() != WL_CONNECTED && (millis() - ws) < 10000) {
-                vTaskDelay(pdMS_TO_TICKS(250));
-                snprintf(animBuf, sizeof(animBuf), "Connecting%.*s", tick % 4, "....");
-                statusLine(3, "WiFi:", animBuf, TFT_YELLOW);
-                tick++;
-            }
-
-            if (WiFi.status() == WL_CONNECTED) {
-                g_wifiOk = true;
-                esp_wifi_set_ps(WIFI_PS_NONE);
-                int32_t rssi = WiFi.RSSI();
-                String  ip   = WiFi.localIP().toString();
-                char    buf[40];
-                snprintf(buf, sizeof(buf), "%s (%ddBm)", ip.c_str(), (int)rssi);
-                statusLine(3, "WiFi:", buf, TFT_GREEN);
-            }
-        }
+    // 2. Close the UDP socket so networkTask's recvfrom() / select() unblocks
+    //    immediately rather than waiting on its 1 ms timeout.
+    if (g_sock >= 0) {
+        close(g_sock);
+        g_sock = -1;
     }
+
+    // 3. Give tasks up to 500 ms to see the flag and exit.
+    //    displayTask has a 100 ms xQueueReceive timeout, so it will exit
+    //    within that window.  networkTask unblocks immediately from the closed
+    //    socket.  This prevents concurrent LCD access between displayTask and
+    //    runOfflinePlayer().
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 4. Shut WiFi hardware down completely.
+    WiFi.disconnect(true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_wifi_stop();
+    WiFi.mode(WIFI_OFF);
+    g_wifiOk = false;
+    Serial.println("[OFFLINE] WiFi radio OFF");
+
+    // 5. Reduce CPU frequency: 240 → 80 MHz.
+    //    Halves dynamic power consumption; 80 MHz is plenty for SPIFFS reads
+    //    and JPEGDEC at 15 fps.
+    setCpuFrequencyMhz(160);
+    Serial.printf("[OFFLINE] CPU frequency: %d MHz\n", getCpuFrequencyMhz());
+
+    // 6. Update status display.
+    statusLine(3, "WiFi:", "OFF (power save)", TFT_YELLOW);
+    statusLine(4, "OTA:", "Disabled",          TFT_DARKGREY);
+    statusLine(5, "Mode:", "OFFLINE PLAYER",   TFT_CYAN);
+    statusLine(6, "Status:", "Loading...",     TFT_YELLOW);
 }
 
-// ─────────────────────────────────────────────
-//  NETWORK TASK  (Core 0)
-// ─────────────────────────────────────────────
-// Packet format:
-//   Data:    [0xAA 0xBB frameId tileId chunkId totalChunks sizeHi sizeLo] + payload
-//   Control: [0xAA 0xCC 0x01 debugState]
-//
-// Pipeline flow when tile completes:
-//   1. xSemaphoreTake(slotFree[back])          — wait for renderer to vacate slot
-//   2. assembleTileInto(tId, slot[back])        — PSRAM chunks -> SRAM assembly
-//   3. xQueueSend(decodeQueue, &msg)            — depth-4: returns immediately
-//   4. back = (back + 1) & 3                   — round-robin across 4 slots
-static IRAM_ATTR void networkTask(void*) {
-    g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (g_sock < 0) { vTaskDelete(NULL); return; }
-
-    int rcvbuf = 65536;
-    setsockopt(g_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-    struct sockaddr_in local = {};
-    local.sin_family      = AF_INET;
-    local.sin_port        = htons(UDP_PORT);
-    local.sin_addr.s_addr = INADDR_ANY;
-    if (bind(g_sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
-        close(g_sock); vTaskDelete(NULL); return;
-    }
-    fcntl(g_sock, F_SETFL, O_NONBLOCK);
-
-    // rxBuf is static — avoids stack pressure
-    static uint8_t rxBuf[CHUNK_DATA_SIZE + 16];
-    struct sockaddr_in sender;
-    socklen_t slen = sizeof(sender);
-    uint32_t  lastPktMs = millis(), lastBeaconMs = 0, lastStatMs = 0, pktCount = 0;
-    uint8_t   back = 0;
-
-    while (true) {
-        int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
-                         (struct sockaddr*)&sender, &slen);
-
-        if (n < 0) {
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(g_sock, &rfds);
-            struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
-            select(g_sock + 1, &rfds, NULL, NULL, &tv);
-
-            if ((millis() - lastBeaconMs) > 2000 && (millis() - lastPktMs) > 2000) {
-                struct sockaddr_in bc = {};
-                bc.sin_family         = AF_INET;
-                bc.sin_port           = htons(UDP_PORT);
-                bc.sin_addr.s_addr    = htonl(INADDR_BROADCAST);
-                int so = 1;
-                setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, &so, sizeof(so));
-                const char* b = "S3READY";
-                sendto(g_sock, b, strlen(b), 0, (struct sockaddr*)&bc, sizeof(bc));
-                lastBeaconMs = millis();
-            }
-            continue;
-        }
-
-        lastPktMs = millis(); pktCount++;
-        g_lastPktMs = lastPktMs;   // shared with displayTask for streaming timeout
-        if (n < 4 || rxBuf[0] != 0xAA) { portYIELD(); continue; }
-        memcpy(&g_remoteAddr, &sender, sizeof(sender));
-        g_remoteAddrValid = true;
-
-        if (rxBuf[1] == 0xCC) {
-            if (n >= 4 && rxBuf[2] == 0x01) debugEnabled = (rxBuf[3] == 1);
-            portYIELD(); continue;
-        }
-
-        if (rxBuf[1] != 0xBB || n < 8) { portYIELD(); continue; }
-        uint8_t  fId     = rxBuf[2];
-        uint8_t  tId     = rxBuf[3];
-        uint8_t  cId     = rxBuf[4];
-        uint8_t  nChunks = rxBuf[5];
-        uint16_t fSize   = ((uint16_t)rxBuf[6] << 8) | rxBuf[7];
-        int      dataLen = n - 8;
-        if (tId >= NUM_TILES || dataLen <= 0) { portYIELD(); continue; }
-
-        TileState& ts = tiles[tId];
-
-        if (ts.firstChunkMs > 0 && (millis() - ts.firstChunkMs) > TILE_TIMEOUT_MS) {
-            ts.stat_timeout++;
-            resetTile(tId);
-        }
-
-        if (fId != ts.frameId) {
-            resetTile(tId);
-            ts.frameId      = fId;
-            ts.totalChunks  = nChunks;
-            ts.frameSize    = fSize;
-            ts.firstChunkMs = millis();
-        }
-
-        if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
-            memcpy(ts.chunkBuf[cId], &rxBuf[8], dataLen);
-            ts.chunkLen[cId] = (uint16_t)dataLen;
-            ts.chunkGot[cId] = true;
-            ts.chunksGot++;
-        }
-
-        if (ts.chunksGot >= ts.totalChunks) {
-            xSemaphoreTake(slotFree[back], portMAX_DELAY);
-            int len = assembleTileInto(tId, slot[back].assembly);
-
-            if (len > 0) {
-                DecodeMsg msg = { fId, tId, back, (uint16_t)len };
-                xQueueSend(decodeQueue, &msg, portMAX_DELAY);
-                back = (back + 1) & 3;   // round-robin across 4 slots
-            } else {
-                xSemaphoreGive(slotFree[back]);
-            }
-            resetTile(tId);
-        }
-
-        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 400) {
-            uint32_t el = millis() - lastStatMs;
-
-            static uint32_t lastPresented = 0;
-            uint32_t nowPresented = g_presentedFrames;
-            uint32_t frames = nowPresented - lastPresented;
-            lastPresented = nowPresented;
-            float fps = frames / (el / 1000.0f);
-
-            uint32_t totalDrop = 0;
-            for (int i = 0; i < NUM_TILES; i++)
-                totalDrop += tiles[i].stat_corrupt + tiles[i].stat_timeout;
-
-            static uint32_t lastAborted = 0;
-            uint32_t nowAborted = g_abortedFrames;
-            uint32_t aborted = nowAborted - lastAborted;
-            lastAborted = nowAborted;
-
-            uint32_t freeSRAM  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-            uint32_t totalSRAM = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-            uint32_t freePSR   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-            uint32_t totalPSR  = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-            float    tempC     = temperatureRead();
-            uint32_t decUs     = g_avgDecodeUs; 
-
-            snprintf(debugBuf, sizeof(debugBuf),
-                "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"
-                "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
-                0xAB, 0xCD,
-                fps, tempC, stat_jitter,
-                decUs, totalDrop, aborted,
-                freeSRAM / 1024, totalSRAM / 1024,
-                freePSR  / 1024, totalPSR  / 1024);
-
-            sendto(g_sock, debugBuf, strlen(debugBuf), 0,
-                   (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
-
-            for (int i = 0; i < NUM_TILES; i++)
-                tiles[i].stat_decoded = tiles[i].stat_corrupt = tiles[i].stat_timeout = 0;
-            pktCount = 0;
-            lastStatMs = millis();
-        }
-
-        portYIELD();
-    }
-}
-// ─────────────────────────────────────────────
-//  DISPLAY HELPERS
-// ─────────────────────────────────────────────
-static void statusLine(uint8_t row, const char* label, const char* value,
-                       uint32_t col) {
-    int y = 58 + row * 22;
-    lcd.fillRect(0, y, SCREEN_W, 22, TFT_BLACK);
-    lcd.setTextColor(0x7BEF, TFT_BLACK); lcd.drawString(label, 8,   y + 3);
-    lcd.setTextColor(col,    TFT_BLACK); lcd.drawString(value, 138, y + 3);
-}
-
-static void drawBootHeader() {
-    lcd.fillScreen(TFT_BLACK);
-    lcd.setTextFont(2); lcd.setTextSize(1);
-    lcd.fillRect(0, 0, SCREEN_W, 54, 0x1082);
-    lcd.setTextColor(TFT_CYAN, 0x1082); lcd.setTextSize(2);
-    lcd.drawString("ESP32-S3 STREAM", 8, 6);
-    lcd.setTextSize(1); lcd.setTextColor(0x7BEF, 0x1082);
-    lcd.drawString("ILI9341  320x240  ping-pong", 8, 34);
-    lcd.drawFastHLine(0, 54, SCREEN_W, TFT_DARKGREY);
-}
-
-// ─────────────────────────────────────────────
-//  DISPLAY TASK  (Core 0, priority 2)
-// ─────────────────────────────────────────────
-// Pinned to Core 0 alongside networkTask (priority 3).
-// networkTask always preempts displayTask on UDP packet arrival.
-// depth-2 displayQueue means Core 1 never blocks even if Core 0 is mid-push.
-// Single pushImage covers the full 320×240 frame atomically — no tile seam.
-//
-// Streaming-timeout overlay:
-//   After the first packet arrives (g_streaming=true), if g_lastPktMs hasn't
-//   been updated for PKT_TIMEOUT_MS the task draws a flashing text overlay
-//   directly on the LCD ("LOOSE CONNECTION / ATTEMPT TO CONNECT BACK").
-//   The overlay flashes between white and red every OVERLAY_FLASH_MS.
-//   It respects the display rotation set in setup() (setRotation(1) = landscape,
-//   origin top-left of the *rotated* frame, so X=0..319 left-right,
-//   Y=0..239 top-bottom).  The overlay is drawn at the top-left corner.
-//   When packets resume, the overlay disappears on the next pushImage.
-static void displayTask(void*) {
-    DisplayMsg dmsg;
-    bool    overlayVisible  = false;
-    bool    overlayPhase    = false;   // false=white, true=red
-    uint32_t lastFlipMs     = 0;
-
-    while (true) {
-        // ── Try to receive a new frame (100 ms timeout so we can still draw overlay) ──
-        bool gotFrame = (xQueueReceive(displayQueue, &dmsg, pdMS_TO_TICKS(100)) == pdTRUE);
-
-        if (gotFrame) {
-            lcd.pushImage(0, 0, SCREEN_W, SCREEN_H, frameFb[dmsg.bufSet]);
-            g_presentedFrames++;
-        }
-
-        // ── Streaming-timeout overlay ─────────────────────────────────────
-        if (!g_streaming) { overlayVisible = false; continue; }
-
-        uint32_t now      = millis();
-        uint32_t silence  = now - g_lastPktMs;
-        bool     timedOut = (silence >= PKT_TIMEOUT_MS);
-
-        if (!timedOut) {
-            // Packets flowing normally — clear overlay flag; no extra draw needed
-            // (the pushImage above already painted the fresh frame).
-            overlayVisible = false;
-            continue;
-        }
-
-        // No packet for >= 3 s → draw / refresh the flashing overlay
-        // Flip phase every OVERLAY_FLASH_MS
-        if (!overlayVisible || (now - lastFlipMs) >= OVERLAY_FLASH_MS) {
-            overlayPhase = !overlayPhase;
-            lastFlipMs   = now;
-            overlayVisible = true;
-
-            // ── Overlay geometry (accounts for rotation=1: 320 wide × 240 tall) ──
-            // Two lines of text, top-left corner, semi-transparent filled rect behind.
-            const int OX = 4;    // left margin (rotated X)
-            const int OY = 4;    // top margin  (rotated Y)
-            const int OW = 236;  // overlay box width  (fits in 320-px wide rotated frame)
-            const int OH = 38;   // overlay box height (two rows of font2 ~16px each)
-
-            uint32_t bgColor   = 0x2000;  // dark red background
-            uint32_t textColor = overlayPhase ? TFT_WHITE : TFT_RED;
-
-            lcd.fillRect(OX, OY, OW, OH, bgColor);
-            lcd.setTextFont(2);
-            lcd.setTextSize(1);
-            lcd.setTextColor(textColor, bgColor);
-            lcd.drawString("LOOSE CONNECTION",           OX + 4, OY + 3);
-            lcd.drawString("ATTEMPT TO CONNECT BACK...", OX + 4, OY + 20);
-        }
-    }
-}
 
 // ─────────────────────────────────────────────
 //  SETUP
@@ -722,22 +232,14 @@ void setup() {
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
     if (!psramOk) { while (1) delay(1000); }
 
-    // ── Allocate SRAM decode scratch (Core-1 exclusive) ──────────────────
-    // JPEGDEC scatter-writes LE pixels here (38 KB, 16-byte aligned).
-    // bswap16_memcpy_simd() reads once, byte-swaps, writes BE to PSRAM.
+    // ── Allocate SRAM decode scratch (Core-1 exclusive) ──────────────────────
     decodeTemp = (uint16_t*)heap_caps_aligned_alloc(
-        16, TILE_PIXELS * 2,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        16, TILE_PIXELS * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!decodeTemp) {
-        Serial.println("[ERROR] decodeTemp SRAM alloc failed");
-        statusLine(2, "DecTemp:", "ALLOC FAILED!", TFT_RED);
+        statusLine(2, "Buffers:", "decodeTemp FAILED", TFT_RED);
         while (1) delay(1000);
     }
 
-    // ── Allocate pipeline slots ───────────────────────────────────────────
-    // 16-byte aligned: satisfies the & 15 guard in decodeSlot.
-    // NUM_SLOTS=4: 4 x 33.6 KB = 134.4 KB SRAM — allows back-to-back tile
-    // posts to depth-4 decodeQueue without blocking networkTask.
     bool allocOk = true;
     for (int s = 0; s < NUM_SLOTS; s++) {
         slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(
@@ -748,8 +250,6 @@ void setup() {
         }
     }
 
-    // ── Allocate double-buffered full-frame framebuffers in PSRAM ────────
-    // 320×240×2 = 153,600 bytes each. 16-byte aligned for bswap16_memcpy_simd.
     for (int s = 0; s < 2 && allocOk; s++) {
         frameFb[s] = (uint16_t*)heap_caps_aligned_alloc(
             16, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
@@ -759,7 +259,6 @@ void setup() {
         }
     }
 
-    // ── Allocate chunk staging -> PSRAM ──────────────────────────────────
     for (int t = 0; t < NUM_TILES && allocOk; t++) {
         tileChunkStorage[t] = (uint8_t*)heap_caps_malloc(
             (size_t)MAX_TILE_CHUNKS * CHUNK_DATA_SIZE, MALLOC_CAP_SPIRAM);
@@ -776,23 +275,16 @@ void setup() {
         while (1) delay(1000);
     }
 
-    // ── Pipeline sync primitives ──────────────────────────────────────────
-    decodeQueue  = xQueueCreate(NUM_SLOTS, sizeof(DecodeMsg));  // depth-4: no blocking on post
+    // ── Pipeline sync primitives ──────────────────────────────────────────────
+    decodeQueue  = xQueueCreate(NUM_SLOTS, sizeof(DecodeMsg));
     displayQueue = xQueueCreate(2, sizeof(DisplayMsg));
     for (int s = 0; s < NUM_SLOTS; s++) {
         slotFree[s] = xSemaphoreCreateBinary();
         xSemaphoreGive(slotFree[s]);
     }
 
-    Serial.printf("[MEM] decodeTemp       : %u B SRAM (16-byte aligned)\n", TILE_PIXELS * 2);
-    for (int s = 0; s < NUM_SLOTS; s++)
-        Serial.printf("[MEM] slot[%d].assembly : %u B SRAM\n", s, MAX_TILE_JPEG);
-    Serial.printf("[MEM] SRAM slots total : %u B (%d x %u)\n",
-                  NUM_SLOTS * MAX_TILE_JPEG, NUM_SLOTS, MAX_TILE_JPEG);
-    Serial.printf("[MEM] frameFb x2       : %u B PSRAM (16-byte aligned, double-buffered)\n",
-                  2 * SCREEN_W * SCREEN_H * 2);
-    Serial.printf("[MEM] chunkStorage x4  : %u B PSRAM\n",
-                  NUM_TILES * MAX_TILE_CHUNKS * CHUNK_DATA_SIZE);
+    statusLine(2, "Buffers:", "OK (2-frame depth)", TFT_GREEN);
+
     Serial.printf("[MEM] free SRAM  : %lu KB / %lu KB\n",
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL)  / 1024,
         heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024);
@@ -800,57 +292,120 @@ void setup() {
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM)  / 1024,
         heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
 
-    statusLine(2, "Buffers:", "Enabled (2 frame depth)", TFT_GREEN);
+    // ── SPIFFS — mounted now so initOfflinePlayer() is available later ────────
+    // The partition table (partitions_16MB_ota.csv) must include a spiffs entry.
+    // Use PlatformIO "Upload Filesystem Image" to upload .mjpeg files.
+    // Mount failure is non-fatal here; offline mode will report no files found.
+    bool spiffsOk = SPIFFS.begin(false);
+    Serial.printf("[SPIFFS] %s\n", spiffsOk ? "mounted OK" : "mount failed (no SPIFFS partition?)");
 
-    // ── WiFi ──────────────────────────────────────────────────────────────
+    // ── WiFi — try for up to WIFI_CONNECT_TIMEOUT_MS ─────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
-    WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
-    
-    // Force 802.11n HT40 for maximum throughput in clean, short-range environment
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
-    
-    uint32_t ws = millis(); uint8_t tick = 0;
+
+    uint32_t ws = millis();
+    uint8_t  tick = 0;
+    bool wifiConnected = false;
+
     while (WiFi.status() != WL_CONNECTED) {
-        delay(250); tick++;
-        char buf[24]; snprintf(buf, sizeof(buf), "Connecting%.*s", tick % 4, "....");
+        delay(250);
+        tick++;
+        char buf[24];
+        snprintf(buf, sizeof(buf), "Connecting%.*s", tick % 4, "....");
         statusLine(3, "WiFi:", buf, TFT_YELLOW);
-        if (millis() - ws > 200000) {
-            statusLine(3, "WiFi:", "TIMEOUT!", TFT_RED);
-            delay(3000); ESP.restart();
+
+        if (millis() - ws > WIFI_CONNECT_TIMEOUT_MS) {
+            Serial.println("[WIFI] Association timeout");
+            statusLine(3, "WiFi:", "Timeout", TFT_RED);
+
+            // Attempt offline mode
+            if (initOfflinePlayer()) {
+                enterOfflineMode();
+                // loop() will call runOfflinePlayer() — skip task creation
+                return;
+            }
+            // No files either → restart and try again
+            statusLine(3, "WiFi:", "No offline files — restart", TFT_RED);
+            delay(3000);
+            ESP.restart();
         }
     }
+
+    wifiConnected = true;
     esp_wifi_set_ps(WIFI_PS_NONE);
     g_wifiOk = true;
+    g_wifiConnectedMs = millis();   // start the offline-trigger countdown
+
     String ip = WiFi.localIP().toString();
-    char ipBuf[36]; snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
+    char ipBuf[36];
+    snprintf(ipBuf, sizeof(ipBuf), "%s (%ddBm)", ip.c_str(), WiFi.RSSI());
     statusLine(3, "WiFi:", ipBuf, TFT_GREEN);
-    statusLine(5, "Mode:",   "Wireless display",       TFT_CYAN);
-    statusLine(6, "Status:", "Waiting for PC...",       TFT_YELLOW);
+    statusLine(5, "Mode:",   "Wireless display",  TFT_CYAN);
+    statusLine(6, "Status:", "Waiting for PC...", TFT_YELLOW);
     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
 
-    // ── OTA ──────────────────────────────────────────────────────────────────
-    // Must start after WiFi is up. Priority 1 = lowest; never preempts net/display.
+    // Pre-scan SPIFFS so initOfflinePlayer is fast if needed later
+    initOfflinePlayer();
+
+    // ── OTA ───────────────────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(otaTask, "OTA", 8192, NULL, 1, NULL, 0);
     statusLine(4, "OTA:", "Ready (esp32s3-display)", TFT_CYAN);
 
-    // networkTask: priority 3, always preempts displayTask for UDP responsiveness
-    // displayTask: priority 2, fills Core 0 idle gaps between UDP bursts
-    // wifiWatchdogTask: priority 1, lowest — RSSI refresh and reconnect on drop
-    xTaskCreatePinnedToCore(networkTask,      "NetTask",   10240, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(displayTask,      "DispTask",  4096,  NULL, 2, NULL, 0);
-    xTaskCreatePinnedToCore(wifiWatchdogTask, "WiFiWatch", 3072,  NULL, 1, NULL, 0);
+    // ── Streaming tasks ───────────────────────────────────────────────────────
+    xTaskCreatePinnedToCore(networkTask,     "NetTask",     10240, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(wifiWatchdogTask,"WifiWatchdog", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 2, NULL, 0);
     Serial.println("[OK] Ready.");
 }
+
 
 // ─────────────────────────────────────────────
 //  MAIN LOOP  (Core 1 — renderer)
 // ─────────────────────────────────────────────
-// Core 1 is 100% dedicated to JPEG decode. LCD push runs in displayTask on Core 0.
-//
-// Per tile: decode -> decodeTemp (SRAM, LE) -> bswap16_memcpy_simd (row-stride) -> frameFb (PSRAM, BE)
-// When all 4 tiles ready: post DisplayMsg -> displayQueue, flip writeSet.
 void loop() {
+
+    // ── Offline mode: hand Core 1 to the MJPEG player forever ────────────────
+    // runOfflinePlayer() is an infinite loop; it never returns.
+    // Reaching this point means enterOfflineMode() was called and all streaming
+    // tasks have (or are in the process of) self-terminating.
+    if (g_offlineMode) {
+        runOfflinePlayer();
+        return;   // unreachable — satisfies the compiler
+    }
+
+    // ── Offline-trigger watchdog ───────────────────────────────────────────────
+    // If WiFi is up but no stream packet has arrived within OFFLINE_TRIGGER_MS
+    // of WiFi association, switch to offline mode.
+    // g_wifiConnectedMs is set when WiFi first connects in setup().
+    // g_streaming becomes true when the first tile is decoded.
+    if (!g_streaming
+        && g_wifiOk
+        && g_wifiConnectedMs > 0
+        && (millis() - g_wifiConnectedMs) > OFFLINE_TRIGGER_MS) {
+
+        Serial.println("[MAIN] No stream after 5 s — checking for offline files...");
+        // initOfflinePlayer() was called speculatively in setup(); s_fileCount is ready.
+        enterOfflineMode();
+        // Next call to loop() hits the g_offlineMode branch above and starts playback.
+        return;
+    }
+
+    // ── WiFi disconnection watchdog ───────────────────────────────────────────
+    // If WiFi is disconnected for more than 10 seconds, enter offline mode.
+    if (!g_wifiOk
+        && g_wifiDisconnectedMs > 0
+        && (millis() - g_wifiDisconnectedMs) > 10000) {
+
+        Serial.println("[MAIN] WiFi disconnected for 10 s — entering offline mode");
+        enterOfflineMode();
+        return;
+    }
+
+    // ── Normal streaming decode path ──────────────────────────────────────────
     static bool     streamStarted = false;
     static uint32_t decodeAcc     = 0;
     static uint32_t decodeCount   = 0;
@@ -896,19 +451,16 @@ void loop() {
         if (!streamStarted) {
             streamStarted = true;
             g_streaming   = true;
-            g_lastPktMs   = millis();   // baseline so overlay doesn't fire immediately
+            g_lastPktMs   = millis();
             statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
-            // ลบ Serial.printf ของ First Tile ออก และคง delay ไว้ให้จออัปเดตทัน
-            delay(200); 
+            delay(200);
         }
-
-        // ลบ Serial.printf ของ avg decode ทุกๆ 120 เฟรมออกไปแล้ว
 
         if (readyMask == 0x0F) {
             DisplayMsg dmsg = { msg.frameId, writeSet };
             if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
-                g_abortedFrames++;   
-            writeSet ^= 1;   
+                g_abortedFrames++;
+            writeSet ^= 1;
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;

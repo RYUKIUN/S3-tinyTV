@@ -341,13 +341,21 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
 
 if __name__ == "__main__":
     set_high_priority(); set_high_resolution_timer()
-    print("[Discovery] Searching for ESP32-S3...")
+    print("[Discovery] Searching for ESP32-S3")
     s_disc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s_disc.bind(('0.0.0.0', PORT)); s_disc.settimeout(5.0)
+    s_disc.bind(('0.0.0.0', PORT))
+    s_disc.settimeout(None)
     try:
-        data, addr = s_disc.recvfrom(256)
-        if "S3READY" in data.decode(errors='ignore'):
-            stream_mss_udp(addr[0], *select_monitor())
-    except: print("[ERROR] No ESP found.")
-    finally: s_disc.close(); reset_resolution_timer()
+        while True:
+            data, addr = s_disc.recvfrom(256)
+            if b"S3READY" in data:
+                print(f"[Discovery] Found ESP32-S3 at {addr[0]}")
+                stream_mss_udp(addr[0], *select_monitor())
+                break
+    except KeyboardInterrupt:
+        print("[INFO] Discovery cancelled by user.")
+    except Exception as e:
+        print(f"[ERROR] Discovery failed: {e}")
+    finally:
+        s_disc.close(); reset_resolution_timer()
     

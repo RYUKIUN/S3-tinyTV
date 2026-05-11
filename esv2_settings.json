@@ -1,0 +1,7 @@
+{
+  "fps": 24,
+  "iframe_interval": 24,
+  "jpeg_quality": 70,
+  "patch_quality": 35,
+  "threshold": 12
+}

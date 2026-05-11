@@ -1,0 +1,6 @@
+{
+  "fps": 24,
+  "qscale": 8,
+  "sharpen": 0.6,
+  "gop": 30
+}
