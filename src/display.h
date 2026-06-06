@@ -4,28 +4,52 @@
 #include <LovyanGFX.hpp>
 
 class LGFX : public lgfx::LGFX_Device {
-    lgfx::Bus_Parallel8  _bus;
+    lgfx::Bus_SPI        _bus;   // ← SPI instead of Parallel8
     lgfx::Panel_ILI9341  _panel;
 public:
     LGFX() {
         {
             auto cfg = _bus.config();
-            cfg.freq_write = 30000000;
-            cfg.pin_wr = 1; cfg.pin_rd = 40; cfg.pin_rs = 2;
-            cfg.pin_d0 = 5; cfg.pin_d1 = 4;  cfg.pin_d2 = 10;
-            cfg.pin_d3 = 9; cfg.pin_d4 = 3;  cfg.pin_d5 = 8;
-            cfg.pin_d6 = 7; cfg.pin_d7 = 6;
+
+            // ── SPI host ──────────────────────────────────────────────────────
+            // USE_HSPI_PORT=1 in the original build flags means SPI2 host.
+            // LovyanGFX uses spi_host_device_t: SPI2_HOST = 1, SPI3_HOST = 2.
+            cfg.spi_host   = SPI2_HOST;   // SPI2 (HSPI)
+            cfg.freq_write = 80000000;    // 80 MHz write clock
+            cfg.freq_read  =  8000000;    // conservative read (MISO unused here)
+
+            // ── Pins (from build_flags) ───────────────────────────────────────
+            cfg.pin_sclk = 12;   // TFT_SCLK
+            cfg.pin_mosi = 13;   // TFT_MOSI
+            cfg.pin_miso = -1;   // not connected
+            cfg.pin_dc   =  4;   // TFT_DC  (Data/Command)
+
+            cfg.spi_3wire  = false;  // 4-wire SPI (MOSI + DC line)
+            cfg.use_lock   = true;   // safe for multi-device SPI bus
+
             _bus.config(cfg);
             _panel.setBus(&_bus);
         }
         {
             auto cfg = _panel.config();
-            cfg.pin_cs = 41; cfg.pin_rst = 39; cfg.pin_busy = -1;
-            cfg.panel_width = 240; cfg.panel_height = 320;
-            cfg.offset_x = 0; cfg.offset_y = 0; cfg.offset_rotation = 0;
+
+            cfg.pin_cs   = 10;   // TFT_CS
+            cfg.pin_rst  =  5;   // TFT_RST
+            cfg.pin_busy = -1;
+
+            cfg.panel_width  = 240;
+            cfg.panel_height = 320;
+            cfg.offset_x        = 0;
+            cfg.offset_y        = 0;
+            cfg.offset_rotation = 0;
             cfg.dummy_read_pixel = 8;
-            cfg.readable = false; cfg.invert = false;
-            cfg.rgb_order = false; cfg.dlen_16bit = false; cfg.bus_shared = false;
+
+            cfg.readable    = false;
+            cfg.invert      = false;
+            cfg.rgb_order   = false;
+            cfg.dlen_16bit  = false;
+            cfg.bus_shared  = true;   // ← true: CS must be driven; touch shares bus
+
             _panel.config(cfg);
         }
         setPanel(&_panel);
