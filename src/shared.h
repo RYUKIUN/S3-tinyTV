@@ -19,10 +19,10 @@
 
 // ── Offline-mode timeouts ─────────────────────────────────────────────────────
 // How long to wait for WiFi association before giving up and going offline.
-#define WIFI_CONNECT_TIMEOUT_MS  15000
+#define WIFI_CONNECT_TIMEOUT_MS  150000
 // How long after WiFi connects with no stream packet before going offline.
 // Gives the PC sender time to discover the ESP via beacon.
-#define OFFLINE_TRIGGER_MS       5000
+#define OFFLINE_TRIGGER_MS       500000
 
 // ── Display geometry ──────────────────────────────────────────────────────────
 #define SCREEN_W         320

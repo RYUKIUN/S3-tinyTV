@@ -21,7 +21,7 @@ MAGIC_420 = 17200
 MAGIC_444 = 17000
 
 # EMA Settings (Low-pass filter for bitrate)
-EMA_ALPHA = 0.15  # ค่ายิ่งน้อย ยิ่งสมูทแต่ตอบสนองช้าลง (แนะนำ 0.1 - 0.2)
+EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแต่ตอบสนองช้าลง (แนะนำ 0.1 - 0.2)
 
 CHUNK_DATA_SIZE  = 1400          
 NUM_TILES        = 4
@@ -281,15 +281,12 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
             else:
                 ema_avg_bytes = (EMA_ALPHA * last_frame_bytes) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
 
-            # ขยาย Deadband: ยอมให้เกินได้ 5% (Upper) และเริ่มไต่ขึ้นเมื่อต่ำกว่า 80% (Lower)
-            upper_bound = magic_threshold * 1.05
+            upper_bound = magic_threshold * 1
             lower_bound = magic_threshold * 0.90
 
             if ema_avg_bytes > upper_bound:
-                # ลดทีละ 2 เพื่อความละมุน ไม่ให้ Undershoot แรงเกินไป
                 current_qual = max(5, current_qual - 2)
             elif ema_avg_bytes < lower_bound:
-                # ค่อยๆ ไต่กลับขึ้นไป
                 current_qual = min(user_max_qual, current_qual + 1)
             # ─────────────────────────────────────────────
 
@@ -310,6 +307,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
                     (f"JIT  : {latest_esp_stats.get('JIT', '?'):>7} ms", _diag_color(latest_esp_stats.get('JIT', '0'), DIAG_JIT_WARN, DIAG_JIT_ERR)),
                     (f"DEC  : {latest_esp_stats.get('DEC', '?'):>7} us", _diag_color(latest_esp_stats.get('DEC', '0'), 8000, 15000)),
                     (f"DROP : {latest_esp_stats.get('DROP', '?'):>8}", _diag_color(latest_esp_stats.get('DROP', '0'), 1, 5)),
+                    (f"CPU0 : {latest_esp_stats.get('CPU0', '?'):>7} %", (200,200,200)),
+                    (f"CPU1 : {latest_esp_stats.get('CPU1', '?'):>7} %", (200,200,200)),
                     (f"RAW  : {last_frame_bytes:>8} B", size_col),
                     (f"AVG  : {int(ema_avg_bytes):>8} B", (255, 200, 0)), # สีฟ้าอ่อนแสดงค่าเฉลี่ย
                     (f"QUAL : {current_qual:>8} (Max {user_max_qual})", (0, 255, 255)),
