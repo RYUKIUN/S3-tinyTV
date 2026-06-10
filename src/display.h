@@ -15,8 +15,8 @@ public:
             // USE_HSPI_PORT=1 in the original build flags means SPI2 host.
             // LovyanGFX uses spi_host_device_t: SPI2_HOST = 1, SPI3_HOST = 2.
             cfg.spi_host   = SPI2_HOST;   // SPI2 (HSPI)
-            cfg.freq_write = 80000000;    // 80 MHz write clock
-            cfg.freq_read  =  8000000;    // conservative read (MISO unused here)
+            cfg.freq_write = 60000000;    // 80 MHz write clock
+            // cfg.freq_read  =  8000000;    // conservative read (MISO unused here)
 
             // ── Pins (from build_flags) ───────────────────────────────────────
             cfg.pin_sclk = 12;   // TFT_SCLK

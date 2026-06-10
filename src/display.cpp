@@ -56,6 +56,7 @@ void displayTask(void*) {
             lcd.pushImage(0, 0, SCREEN_W, SCREEN_H, frameFb[dmsg.bufSet]);
             g_presentedFrames++;
             overlayVisible = false;
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
         if (!g_streaming) {

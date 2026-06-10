@@ -303,6 +303,7 @@ void setup() {
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    esp_wifi_set_max_tx_power(40);   // ~10 dBm — the community fix
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
