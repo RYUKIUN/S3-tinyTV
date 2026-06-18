@@ -1,10 +1,11 @@
 #include "display.h"
+#include "esp_task_wdt.h"
 
 LGFX lcd;
 
 void initDisplay() {
     lcd.init();
-    lcd.setRotation(1);
+    lcd.setRotation(3);
     lcd.setColorDepth(16);
     lcd.setTextFont(2);
     lcd.setTextSize(1);
@@ -34,7 +35,10 @@ void drawBootHeader() {
 }
 
 void displayTask(void*) {
+    esp_task_wdt_add(NULL);  // register this task as its own TWDT subscriber
+
     DisplayMsg dmsg;
+    bool dmaPending    = false;  // true while a pushPixelsDMA transfer is in flight
     bool overlayVisible = false;
     uint32_t lastOverlayMs = 0;
 
@@ -45,55 +49,91 @@ void displayTask(void*) {
         // enterOfflineMode() waits 500 ms after setting this flag, giving us
         // plenty of time to reach this check and self-delete.
         if (g_offlineMode) {
+            if (dmaPending) {
+                lcd.waitDMA();
+                lcd.endWrite();
+                dmaPending = false;
+            }
             Serial.println("[DISP] Offline mode — displayTask exiting");
+            esp_task_wdt_delete(NULL);
             vTaskDelete(NULL);
             return;
         }
 
-        bool gotFrame = (xQueueReceive(displayQueue, &dmsg, pdMS_TO_TICKS(100)) == pdTRUE);
-
-        if (gotFrame) {
-            lcd.pushImage(0, 0, SCREEN_W, SCREEN_H, frameFb[dmsg.bufSet]);
+        // ── Poll DMA completion — yield cooperatively while busy ──────────────
+        // pushPixelsDMA returns immediately; we loop here with taskYIELD() so
+        // the IDLE task (and other tasks) keep getting CPU time, which also feeds
+        // the TWDT without any artificial vTaskDelay.
+        if (dmaPending) {
+            if (lcd.dmaBusy()) {
+                esp_task_wdt_reset();
+                taskYIELD();
+                continue;
+            }
+            // DMA finished — release bus and account for the frame
+            lcd.waitDMA();   // guaranteed near-instant since dmaBusy() was false
+            lcd.endWrite();
+            dmaPending = false;
             g_presentedFrames++;
             overlayVisible = false;
-            vTaskDelay(pdMS_TO_TICKS(1));
+            esp_task_wdt_reset();
         }
 
+        // ── Pull next frame from queue ────────────────────────────────────────
+        // 8 ms timeout: tight enough to keep the DMA-busy polling loop responsive,
+        // long enough not to burn CPU on empty spins between frames.
+        bool gotFrame = (xQueueReceive(displayQueue, &dmsg, pdMS_TO_TICKS(8)) == pdTRUE);
+
+        if (gotFrame) {
+            // Fire DMA and return immediately — CPU does no pixel work at all.
+            // frameFb[dmsg.bufSet] must stay valid until dmaPending clears, which
+            // the ping-pong buffer design guarantees (decoder won't reclaim it
+            // until we signal completion after waitDMA).
+            lcd.startWrite();
+            lcd.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
+            lcd.pushPixelsDMA(frameFb[dmsg.bufSet], SCREEN_W * SCREEN_H);
+            dmaPending = true;
+            continue;  // loop back immediately; don't touch bus until DMA is done
+        }
+
+        // ── No frame and no DMA in flight — handle streaming overlay ──────────
         if (!g_streaming) {
             overlayVisible = false;
+            esp_task_wdt_reset();
             continue;
         }
 
         uint32_t now = millis();
-        bool timedOut = ((now - g_lastPktMs) >= PKT_TIMEOUT_MS);
-        if (!timedOut) {
+        if ((now - g_lastPktMs) < PKT_TIMEOUT_MS) {
             overlayVisible = false;
+            esp_task_wdt_reset();
             continue;
         }
 
         bool wifiDisconnected = !g_wifiOk;
-        const char* line1 = wifiDisconnected ? "WIFI DISCONNECTED" : "WAITING FOR VIDEO";
-        const char* line2 = wifiDisconnected ? "TRY CONNECT BACK" : "";
-        uint32_t bgColor = wifiDisconnected ? 0x2000 : 0x0841;
+        const char* line1  = wifiDisconnected ? "WIFI DISCONNECTED" : "WAITING FOR VIDEO";
+        const char* line2  = wifiDisconnected ? "TRY CONNECT BACK"  : "";
+        uint32_t bgColor   = wifiDisconnected ? 0x2000 : 0x0841;
         uint32_t textColor = wifiDisconnected ? TFT_WHITE : TFT_YELLOW;
 
         if (!overlayVisible || (now - lastOverlayMs) >= OVERLAY_FLASH_MS) {
-            lastOverlayMs = now;
+            lastOverlayMs  = now;
             overlayVisible = true;
 
-            const int OX = 4;
-            const int OY = 4;
-            const int OW = 236;
-            const int OH = 38;
+            const int OX = 4, OY = 4, OW = 236, OH = 38;
 
+            // Bracket all overlay draw calls in one bus transaction to avoid
+            // repeated SPI lock/unlock overhead per primitive.
+            lcd.startWrite();
             lcd.fillRect(OX, OY, OW, OH, bgColor);
             lcd.setTextFont(2);
             lcd.setTextSize(1);
             lcd.setTextColor(textColor, bgColor);
             lcd.drawString(line1, OX + 4, OY + 3);
-            if (line2[0]) {
-                lcd.drawString(line2, OX + 4, OY + 20);
-            }
+            if (line2[0]) lcd.drawString(line2, OX + 4, OY + 20);
+            lcd.endWrite();
         }
+
+        esp_task_wdt_reset();
     }
 }

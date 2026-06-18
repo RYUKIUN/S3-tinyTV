@@ -4,7 +4,7 @@
 #include <LovyanGFX.hpp>
 
 class LGFX : public lgfx::LGFX_Device {
-    lgfx::Bus_SPI        _bus;   // ← SPI instead of Parallel8
+    lgfx::Bus_SPI        _bus;
     lgfx::Panel_ILI9341  _panel;
 public:
     LGFX() {
@@ -15,8 +15,7 @@ public:
             // USE_HSPI_PORT=1 in the original build flags means SPI2 host.
             // LovyanGFX uses spi_host_device_t: SPI2_HOST = 1, SPI3_HOST = 2.
             cfg.spi_host   = SPI2_HOST;   // SPI2 (HSPI)
-            cfg.freq_write = 60000000;    // 80 MHz write clock
-            // cfg.freq_read  =  8000000;    // conservative read (MISO unused here)
+            cfg.freq_write = 75000000;    // 60 MHz write clock
 
             // ── Pins (from build_flags) ───────────────────────────────────────
             cfg.pin_sclk = 12;   // TFT_SCLK
@@ -39,16 +38,16 @@ public:
 
             cfg.panel_width  = 240;
             cfg.panel_height = 320;
-            cfg.offset_x        = 0;
-            cfg.offset_y        = 0;
-            cfg.offset_rotation = 0;
+            cfg.offset_x         = 0;
+            cfg.offset_y         = 0;
+            cfg.offset_rotation  = 0;
             cfg.dummy_read_pixel = 8;
 
             cfg.readable    = false;
             cfg.invert      = false;
             cfg.rgb_order   = false;
             cfg.dlen_16bit  = false;
-            cfg.bus_shared  = true;   // ← true: CS must be driven; touch shares bus
+            cfg.bus_shared  = true;   // CS must be driven; touch shares bus
 
             _panel.config(cfg);
         }

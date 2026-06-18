@@ -223,7 +223,7 @@ void setup() {
     while (!Serial && (millis() - t0) < 2000) delay(10);
     Serial.println("\n[BOOT] ping-pong pipeline (SRAM decode + combined bswap/copy)");
 
-    lcd.init(); lcd.setRotation(1); lcd.setColorDepth(16);
+    lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
     drawBootHeader();
     statusLine(0, "Display:", "OK", TFT_GREEN);
