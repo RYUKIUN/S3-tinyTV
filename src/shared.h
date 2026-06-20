@@ -51,6 +51,7 @@ struct DecodeMsg {
     uint8_t  tId;
     uint8_t  slotIdx;
     uint16_t len;
+    uint32_t readyMs;   // millis() when assembleTileInto() completed — for queue-wait stat
 };
 
 struct DisplayMsg {
@@ -62,6 +63,7 @@ struct TileState {
     uint8_t* chunkBuf[MAX_TILE_CHUNKS];
     uint16_t chunkLen[MAX_TILE_CHUNKS];
     bool     chunkGot[MAX_TILE_CHUNKS];
+    uint8_t  chunkFrameId[MAX_TILE_CHUNKS];  // frameId each chunk slot was written under
     uint8_t  frameId      = 0xFF;
     uint8_t  totalChunks  = 0;
     uint16_t frameSize    = 0;
@@ -87,6 +89,25 @@ extern TileState tiles[NUM_TILES];
 extern volatile uint32_t g_avgDecodeUs;
 extern volatile uint32_t g_presentedFrames;
 extern volatile uint32_t g_abortedFrames;
+
+// ── Extended pipeline timing (added for fps/decode diagnosis) ────────────────
+// All are rolling averages over the same 16-sample window as g_avgDecodeUs,
+// updated in main.cpp's loop(). Units: microseconds.
+extern volatile uint32_t g_avgQueueWaitUs;  // tile reassembled -> decodeSlot() starts
+extern volatile uint32_t g_avgDmaPushUs;    // pushPixelsDMA() issued -> dmaBusy() clears
+extern volatile uint32_t g_avgFrameUs;      // first tile of frame -> frame presented
+
+// ── CPU load proxy — DISABLED ──────────────────────────────────────────────────
+// An earlier idle-spinner approach (a dedicated per-core task spinning with
+// taskYIELD()) crashed the board: taskYIELD() never yields to the real
+// FreeRTOS IDLE task (priority 0, below any task we can safely create),
+// so IDLE never ran, the Task Watchdog never got fed, and TWDT aborted
+// within seconds. Removed. These fields are always 0 — visibly "off"
+// rather than silently wrong — until CPU load is wired up via either
+// (a) configGENERATE_RUN_TIME_STATS actually linking in ulTaskGetIdleRunTimeCounter,
+// or (b) direct loop()/networkTask iteration-time instrumentation.
+extern volatile uint32_t g_cpu0SpinHz;      // currently always 0 — see above
+extern volatile uint32_t g_cpu1SpinHz;      // currently always 0 — see above
 
 // ── Streaming / WiFi state ────────────────────────────────────────────────────
 extern volatile bool     g_streaming;        // true once first tile decoded

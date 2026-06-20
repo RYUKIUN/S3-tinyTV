@@ -38,9 +38,12 @@ void displayTask(void*) {
     esp_task_wdt_add(NULL);  // register this task as its own TWDT subscriber
 
     DisplayMsg dmsg;
-    bool dmaPending    = false;  // true while a pushPixelsDMA transfer is in flight
-    bool overlayVisible = false;
-    uint32_t lastOverlayMs = 0;
+    bool dmaPending      = false;  // true while a pushPixelsDMA transfer is in flight
+    bool overlayVisible  = false;
+    uint32_t lastOverlayMs  = 0;
+    uint32_t dmaStartUs     = 0;
+    uint32_t dmaPushAcc     = 0;
+    uint32_t dmaPushCount   = 0;
 
     while (true) {
         // ── Offline-mode shutdown ─────────────────────────────────────────────
@@ -76,6 +79,14 @@ void displayTask(void*) {
             dmaPending = false;
             g_presentedFrames++;
             overlayVisible = false;
+
+            dmaPushAcc += (micros() - dmaStartUs);
+            dmaPushCount++;
+            if (dmaPushCount >= 16) {
+                g_avgDmaPushUs = dmaPushAcc / dmaPushCount;
+                dmaPushAcc = 0; dmaPushCount = 0;
+            }
+
             esp_task_wdt_reset();
         }
 
@@ -91,6 +102,7 @@ void displayTask(void*) {
             // until we signal completion after waitDMA).
             lcd.startWrite();
             lcd.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
+            dmaStartUs = micros();
             lcd.pushPixelsDMA(frameFb[dmsg.bufSet], SCREEN_W * SCREEN_H);
             dmaPending = true;
             continue;  // loop back immediately; don't touch bus until DMA is done

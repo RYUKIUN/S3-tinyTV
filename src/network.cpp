@@ -14,9 +14,30 @@ static IRAM_ATTR void resetTile(uint8_t t) {
     tiles[t].firstChunkMs = 0;
 }
 
+// Re-validates that every chunk slot was written for the SAME frameId
+// currently recorded on the tile, before trusting chunkGot[]/chunkBuf[] for
+// reassembly. This is defense-in-depth on top of the proactive sweep above:
+// even if a reset is ever delayed by more than TILE_TIMEOUT_MS for any reason
+// (long ISR, scheduling jitter, etc.), a chunk written under a stale frameId
+// will still be caught here rather than silently blended into a new frame's
+// reassembly. Costs a few extra byte comparisons per tile-complete event —
+// negligible next to a UDP receive.
+static IRAM_ATTR bool tileChunksConsistent(uint8_t t) {
+    TileState& ts = tiles[t];
+    for (uint8_t c = 0; c < ts.totalChunks; c++) {
+        if (ts.chunkGot[c] && ts.chunkFrameId[c] != ts.frameId) return false;
+    }
+    return true;
+}
+
 static IRAM_ATTR int assembleTileInto(uint8_t t, uint8_t* dst) {
     TileState& ts = tiles[t];
     if (ts.totalChunks == 0) return 0;
+
+    if (!tileChunksConsistent(t)) {
+        ts.stat_corrupt++;
+        return 0;
+    }
 
     int offset = 0;
     for (uint8_t c = 0; c < ts.totalChunks; c++) {
@@ -56,6 +77,7 @@ void networkTask(void*) {
     struct sockaddr_in sender;
     socklen_t slen = sizeof(sender);
     uint32_t lastPktMs = millis(), lastBeaconMs = 0, lastStatMs = 0;
+    uint32_t lastSweepMs = millis();
     uint8_t back = 0;
 
     while (true) {
@@ -67,6 +89,31 @@ void networkTask(void*) {
             Serial.println("[NET] Offline mode — networkTask exiting");
             vTaskDelete(NULL);
             return;
+        }
+
+        // ── Proactive tile-timeout sweep ───────────────────────────────────────
+        // The old design only checked a tile's timeout when a NEW packet for
+        // THAT tile arrived (see below). If a tile's stream goes quiet — e.g.
+        // its last chunk is lost under fast-motion/high-bitrate UDP loss — it
+        // would sit there with stale chunkGot[]/chunkBuf[] state until the next
+        // packet for that specific tile happened to arrive, which could be
+        // frames later. In the meantime, a later xQueueSend for that tile could
+        // still pass the cheap SOI/EOI trailer check in assembleTileInto()
+        // despite containing a mix of an old and new frame's chunks — symptom:
+        // black/scattered corrupt blocks, worse under motion since more chunks
+        // means more chances to lose exactly the closing one.
+        // Running the timeout check here, on a timer, independent of whether
+        // any packet arrived, closes that window.
+        uint32_t nowSweep = millis();
+        if (nowSweep - lastSweepMs >= TILE_TIMEOUT_MS) {
+            for (int t = 0; t < NUM_TILES; t++) {
+                TileState& tsw = tiles[t];
+                if (tsw.firstChunkMs > 0 && (nowSweep - tsw.firstChunkMs) > TILE_TIMEOUT_MS) {
+                    tsw.stat_timeout++;
+                    resetTile(t);
+                }
+            }
+            lastSweepMs = nowSweep;
         }
 
         int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
@@ -129,8 +176,9 @@ void networkTask(void*) {
 
         if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
             memcpy(ts.chunkBuf[cId], &rxBuf[8], dataLen);
-            ts.chunkLen[cId] = (uint16_t)dataLen;
-            ts.chunkGot[cId] = true;
+            ts.chunkLen[cId]      = (uint16_t)dataLen;
+            ts.chunkFrameId[cId]  = fId;
+            ts.chunkGot[cId]      = true;
             ts.chunksGot++;
         }
 
@@ -139,7 +187,7 @@ void networkTask(void*) {
             int len = assembleTileInto(tId, slot[back].assembly);
 
             if (len > 0) {
-                DecodeMsg msg = { fId, tId, back, (uint16_t)len };
+                DecodeMsg msg = { fId, tId, back, (uint16_t)len, millis() };
                 xQueueSend(decodeQueue, &msg, portMAX_DELAY);
                 back = (back + 1) & 3;
             } else {
@@ -172,13 +220,22 @@ void networkTask(void*) {
             uint32_t totalPSR  = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
             float    tempC     = temperatureRead();
             uint32_t decUs     = g_avgDecodeUs;
+            uint32_t qwUs      = g_avgQueueWaitUs;
+            uint32_t dmaUs     = g_avgDmaPushUs;
+            uint32_t frameUs   = g_avgFrameUs;
+            uint32_t spin0     = g_cpu0SpinHz;
+            uint32_t spin1     = g_cpu1SpinHz;
 
+            // CPU0/CPU1 here are idle-spinner rates (spins/sec), NOT percent —
+            // see shared.h's g_cpu0SpinHz comment. Lower = busier core.
             snprintf(debugBuf, sizeof(debugBuf),
-                "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"
+                "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|QW:%lu|DMA:%lu|FRM:%lu"
+                "|DROP:%lu|ABRT:%lu|CPU0:%lu|CPU1:%lu"
                 "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
                 0xAB, 0xCD,
                 fps, tempC, stat_jitter,
-                decUs, totalDrop, aborted,
+                decUs, qwUs, dmaUs, frameUs,
+                totalDrop, aborted, spin0, spin1,
                 freeSRAM / 1024, totalSRAM / 1024,
                 freePSR  / 1024, totalPSR  / 1024);
 

@@ -102,6 +102,12 @@ volatile uint32_t g_avgDecodeUs     = 0;  // avg tile decode us (excl. pushImage
 volatile uint32_t g_presentedFrames = 0;  // frames fully pushed to LCD
 volatile uint32_t g_abortedFrames   = 0;  // partial frames dropped (UDP reorder)
 
+volatile uint32_t g_avgQueueWaitUs  = 0;
+volatile uint32_t g_avgDmaPushUs    = 0;
+volatile uint32_t g_avgFrameUs      = 0;
+volatile uint32_t g_cpu0SpinHz      = 0;
+volatile uint32_t g_cpu1SpinHz      = 0;
+
 // ─────────────────────────────────────────────
 //  GLOBAL STATE DEFINITIONS
 // ─────────────────────────────────────────────
@@ -122,6 +128,33 @@ volatile uint32_t g_wifiDisconnectedMs = 0; // millis() when WiFi last disconnec
 
 // ── Offline mode ──────────────────────────────────────────────────────────────
 volatile bool g_offlineMode = false;   // set by enterOfflineMode(), never cleared
+
+
+// ─────────────────────────────────────────────
+//  CPU LOAD PROXY — REMOVED
+// ─────────────────────────────────────────────
+// A previous version of this file used a dedicated per-core task that spun
+// a counter with taskYIELD() to approximate CPU load (since the FreeRTOS
+// run-time-stats API isn't linked in on this Arduino-framework build).
+//
+// THIS WAS WRONG AND CRASHED THE BOARD: taskYIELD() only yields to tasks
+// that are READY at the same or higher priority. The real FreeRTOS IDLE
+// task is priority 0 — lower than our spinner's priority 1 — so the
+// scheduler had no reason to ever switch to it. IDLE never got to run,
+// the Task Watchdog (which IDLE feeds) never got reset, and the board
+// hit TWDT abort within seconds.
+//
+// g_cpu0SpinHz / g_cpu1SpinHz are left defined as always-zero stubs (see
+// below) so the rest of the pipeline (debug packet, dashboard) doesn't
+// need further changes. If real CPU load visibility is wanted later, the
+// safe paths are: (a) get configGENERATE_RUN_TIME_STATS actually linked
+// in via sdkconfig.defaults + a clean rebuild, and use the real
+// ulTaskGetIdleRunTimeCounter() API, or (b) instrument loop()/networkTask
+// iteration time directly (no new tasks, no watchdog risk).
+static void sampleIdleSpinRates() {
+    // Intentionally a no-op. g_cpu0SpinHz/g_cpu1SpinHz stay at their
+    // initialized value of 0 — visibly "unwired" rather than silently wrong.
+}
 
 
 // ─────────────────────────────────────────────
@@ -364,6 +397,8 @@ void setup() {
 // ─────────────────────────────────────────────
 void loop() {
 
+    sampleIdleSpinRates();  // cheap (internally rate-limited to 1 Hz) — see definition above
+
     // ── Offline mode: hand Core 1 to the MJPEG player forever ────────────────
     // runOfflinePlayer() is an infinite loop; it never returns.
     // Reaching this point means enterOfflineMode() was called and all streaming
@@ -405,13 +440,30 @@ void loop() {
     static bool     streamStarted = false;
     static uint32_t decodeAcc     = 0;
     static uint32_t decodeCount   = 0;
+    static uint32_t queueWaitAcc  = 0;
+    static uint32_t queueWaitCnt  = 0;
 
     static uint8_t  pendingFrame = 0xFF;
     static uint8_t  readyMask    = 0;
     static uint32_t frameStartMs = 0;
+    static uint32_t frameStartUs = 0;   // micros() version, for g_avgFrameUs
+    static uint32_t frameTimeAcc = 0;
+    static uint32_t frameTimeCnt = 0;
 
     DecodeMsg msg;
     if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) return;
+
+    // Queue-wait: time between network.cpp finishing tile reassembly
+    // (DecodeMsg.readyMs, stamped at xQueueSend) and decodeSlot() starting here.
+    // Large/growing values mean Core 1 is backed up — tiles are arriving faster
+    // than they're being consumed, not that decode itself is slow.
+    uint32_t queueWaitMs = millis() - msg.readyMs;
+    queueWaitAcc += queueWaitMs;
+    queueWaitCnt++;
+    if (queueWaitCnt >= 16) {
+        g_avgQueueWaitUs = (queueWaitAcc * 1000) / queueWaitCnt;  // ms->us for consistent units with DEC
+        queueWaitAcc = 0; queueWaitCnt = 0;
+    }
 
     if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
         pendingFrame = 0xFF;
@@ -425,10 +477,18 @@ void loop() {
         pendingFrame = msg.frameId;
         readyMask    = 0;
         frameStartMs = millis();
+        frameStartUs = micros();
     }
 
     uint32_t decUs = 0;
-    bool ok = decodeSlot(msg, decUs);
+    uint16_t mcuCalls = 0;
+    bool ok = decodeSlot(msg, decUs, &mcuCalls);
+
+    static uint32_t mcuLogCounter = 0;
+    // if ((++mcuLogCounter & 0x3F) == 0) {  // every 64th tile, ~once every couple seconds at speed
+    //     Serial.printf("[MCU] tile=%u mcuCallback invocations=%u (decode=%lu us)\n",
+    //                   msg.tId, mcuCalls, decUs);
+    // }
 
     xSemaphoreGive(slotFree[msg.slotIdx]);
 
@@ -453,6 +513,13 @@ void loop() {
         }
 
         if (readyMask == 0x0F) {
+            frameTimeAcc += (micros() - frameStartUs);
+            frameTimeCnt++;
+            if (frameTimeCnt >= 16) {
+                g_avgFrameUs = frameTimeAcc / frameTimeCnt;
+                frameTimeAcc = 0; frameTimeCnt = 0;
+            }
+
             DisplayMsg dmsg = { msg.frameId, writeSet };
             if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
                 g_abortedFrames++;

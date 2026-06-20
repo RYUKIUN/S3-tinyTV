@@ -10,6 +10,7 @@ static JPEGDEC jpeg_dec;
 struct McuCtx {
     uint16_t* fb;     // base = frameFb[writeSet] + TILE_Y*SCREEN_W + TILE_X
     int       stride;
+    uint16_t  callCount;  // # of mcuCallback invocations this decode — diagnostic only
 };
 static McuCtx mcuCtx;
 
@@ -21,6 +22,9 @@ static McuCtx mcuCtx;
 // iWidth/iHeight can be a partial MCU at tile edges (subsampling-dependent),
 // so this must NOT assume full TILE_W-wide, 32-byte-aligned rows the way the
 // old bswap16_memcpy_simd routine did — plain memcpy has no such constraint.
+//
+// callCount++ is the only diagnostic cost paid in this hot path — deliberately
+// not Serial.printf here, which would itself distort decode timing.
 static IRAM_ATTR int mcuCallback(JPEGDRAW* pDraw) {
     McuCtx*         ctx = (McuCtx*)pDraw->pUser;
     uint16_t*       dst = ctx->fb + pDraw->y * ctx->stride + pDraw->x;
@@ -28,6 +32,7 @@ static IRAM_ATTR int mcuCallback(JPEGDRAW* pDraw) {
     int w = pDraw->iWidth, h = pDraw->iHeight;
     for (int r = 0; r < h; r++)
         memcpy(dst + r * ctx->stride, src + r * w, (size_t)w * 2);
+    ctx->callCount++;
     return 1;
 }
 
@@ -35,7 +40,7 @@ void initJpegDecoder() {
     // Currently no decoder-specific init required.
 }
 
-bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
+bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs, uint16_t* mcuCalls) {
     PipeSlot& s = slot[msg.slotIdx];
 
     if ((uintptr_t)s.assembly & 15) {
@@ -50,8 +55,9 @@ bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     // Destination is the tile's own offset inside the PSRAM frame buffer —
     // no SRAM scratch in between. writeSet does not change for the duration
     // of this call (Core-1 exclusive), so it's safe to read once up front.
-    mcuCtx.fb     = frameFb[writeSet] + TILE_Y[msg.tId] * SCREEN_W + TILE_X[msg.tId];
-    mcuCtx.stride = SCREEN_W;
+    mcuCtx.fb        = frameFb[writeSet] + TILE_Y[msg.tId] * SCREEN_W + TILE_X[msg.tId];
+    mcuCtx.stride    = SCREEN_W;
+    mcuCtx.callCount = 0;
 
     if (!jpeg_dec.openRAM(s.assembly, msg.len, mcuCallback)) {
         decodeUs = 0;
@@ -67,6 +73,8 @@ bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     uint32_t t0 = micros();
     int rc = jpeg_dec.decode(0, 0, 0);
     jpeg_dec.close();
+
+    if (mcuCalls) *mcuCalls = mcuCtx.callCount;
 
     if (!rc) {
         decodeUs = 0;
