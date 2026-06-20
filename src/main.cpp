@@ -10,12 +10,17 @@
  *  Memory layout:
  *    slot[0..3].assembly  SRAM  33 KB each (4 × 33.6 KB = 134.4 KB total)
  *                                ─ decoder reads every byte → must be fast
- *    decodeTemp        SRAM   38 KB    Core-1 decode scratch; LE pixels from JPEGDEC
  *    frameFb[0]        PSRAM 150 KB  ─┐ full 320×240 frame; DMA source ONLY
  *    frameFb[1]        PSRAM 150 KB  ─┘ double-buffered; display pushes one atomic frame
  *    chunkStorage[4]   PSRAM 134 KB    chunk staging; network writes, not decode-critical
  *
- *  Total SRAM for buffers: ~104 KB
+ *  JPEGDEC's MCU callback now writes directly into frameFb[writeSet] at the
+ *  tile's offset (BIG_ENDIAN pixel type matches the ILI9341's native byte
+ *  order), eliminating the old SRAM decode-scratch buffer + byte-swap pass
+ *  entirely. One PSRAM write per tile instead of SRAM write + SRAM read +
+ *  PSRAM write.
+ *
+ *  Total SRAM for buffers: ~66 KB (was ~104 KB before removing decodeTemp)
  *
  * OFFLINE MODE
  * ────────────
@@ -72,9 +77,6 @@ const char* WIFI_PASS  = "987654321";
 //  PIPELINE SLOTS DEFINITIONS
 // ─────────────────────────────────────────────
 PipeSlot slot[NUM_SLOTS];
-
-// SRAM scratch for Core-1 decode.
-uint16_t* decodeTemp = nullptr;
 
 // Double-buffered full-frame framebuffers in PSRAM.
 uint16_t* frameFb[2] = { nullptr, nullptr };
@@ -221,7 +223,7 @@ void setup() {
     Serial.begin(115200);
     uint32_t t0 = millis();
     while (!Serial && (millis() - t0) < 2000) delay(10);
-    Serial.println("\n[BOOT] ping-pong pipeline (SRAM decode + combined bswap/copy)");
+    Serial.println("\n[BOOT] ping-pong pipeline (direct-to-PSRAM decode, BE pixels)");
 
     lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
@@ -232,14 +234,7 @@ void setup() {
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
     if (!psramOk) { while (1) delay(1000); }
 
-    // ── Allocate SRAM decode scratch (Core-1 exclusive) ──────────────────────
-    decodeTemp = (uint16_t*)heap_caps_aligned_alloc(
-        16, TILE_PIXELS * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!decodeTemp) {
-        statusLine(2, "Buffers:", "decodeTemp FAILED", TFT_RED);
-        while (1) delay(1000);
-    }
-
+    // ── Allocate SRAM tile-assembly slots ────────────────────────────────────
     bool allocOk = true;
     for (int s = 0; s < NUM_SLOTS; s++) {
         slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(

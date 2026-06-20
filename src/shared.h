@@ -78,7 +78,6 @@ extern QueueHandle_t     displayQueue;
 extern SemaphoreHandle_t slotFree[NUM_SLOTS];
 
 // ── Shared buffers ────────────────────────────────────────────────────────────
-extern uint16_t* decodeTemp;
 extern uint16_t* frameFb[2];
 extern uint8_t*  tileChunkStorage[NUM_TILES];
 extern PipeSlot  slot[NUM_SLOTS];
