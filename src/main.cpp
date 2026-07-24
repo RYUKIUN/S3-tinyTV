@@ -65,6 +65,7 @@
 #include "network.h"
 #include "jpeg_decode.h"
 #include "offline_player.h"
+#include "esp_freertos_hooks.h"
 
 
 // ─────────────────────────────────────────────
@@ -76,18 +77,32 @@ const char* WIFI_PASS  = "987654321";
 // ─────────────────────────────────────────────
 //  PIPELINE SLOTS DEFINITIONS
 // ─────────────────────────────────────────────
-PipeSlot slot[NUM_SLOTS];
+PipeSlot slot[MM_MAX_JPEG_SLOTS];   // only [0..g_numJpegSlots-1] used at runtime
 
-// Double-buffered full-frame framebuffers in PSRAM.
-uint16_t* frameFb[2] = { nullptr, nullptr };
-uint8_t writeSet = 0;  // Core 1 exclusive — no sync needed
+// Framebuffers: sized to maximum; only [0..g_numDisplayBufs-1] allocated at runtime.
+uint16_t* frameFb[MM_MAX_DISPLAY_BUFS] = {};
+uint8_t   writeSet = 0;  // Core 1 exclusive — no sync needed
+
+// Runtime counts (set in setup() after fallback allocation)
+uint8_t g_numJpegSlots   = CFG_NUM_JPEG_SLOTS;
+uint8_t g_numDisplayBufs = CFG_NUM_DISPLAY_BUFS;
 
 // Pipeline synchronisation
-QueueHandle_t     decodeQueue;                // depth-4 queue: net -> renderer
-SemaphoreHandle_t slotFree[NUM_SLOTS];        // given when renderer finishes slot
+QueueHandle_t     decodeQueue;                       // depth = g_numJpegSlots
+SemaphoreHandle_t slotFree[MM_MAX_JPEG_SLOTS];       // only [0..g_numJpegSlots-1] used
 
 // Display pipeline: Core 1 posts here when all 4 tiles are ready.
-QueueHandle_t displayQueue;      // depth-2 queue: renderer -> display task (Core 0)
+QueueHandle_t displayQueue;      // depth = g_numDisplayBufs
+
+// ─────────────────────────────────────────────
+//  PER-CORE CPU UTILISATION (TASK 1)
+// ─────────────────────────────────────────────
+// Incremented by idle hooks — one count per idle-task iteration per core.
+// Network debug task reads 400 ms deltas and computes CPU% from tick rate.
+volatile uint32_t g_cpuIdleTicks[2] = { 0, 0 };
+
+static bool IRAM_ATTR idleHookCore0() { g_cpuIdleTicks[0]++; return false; }
+static bool IRAM_ATTR idleHookCore1() { g_cpuIdleTicks[1]++; return false; }
 
 // ─────────────────────────────────────────────
 //  CHUNK REASSEMBLY STATE DEFINITIONS
@@ -106,7 +121,7 @@ volatile uint32_t g_abortedFrames   = 0;  // partial frames dropped (UDP reorder
 //  GLOBAL STATE DEFINITIONS
 // ─────────────────────────────────────────────
 bool     debugEnabled      = false;
-char     debugBuf[256];
+char     debugBuf[320];
 int      g_sock            = -1;
 struct   sockaddr_in g_remoteAddr;
 bool     g_remoteAddrValid = false;
@@ -234,26 +249,62 @@ void setup() {
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
     if (!psramOk) { while (1) delay(1000); }
 
-    // ── Allocate SRAM tile-assembly slots ────────────────────────────────────
+    // ── JPEG assembly slots (SRAM) — fallback from CFG down to 1 ─────────────
+    // Each slot holds one reassembled tile JPEG (MAX_TILE_JPEG = 33.6 KB SRAM).
+    g_numJpegSlots = CFG_NUM_JPEG_SLOTS;
+    while (g_numJpegSlots >= 1) {
+        // Release any partially-attempted allocations from a previous pass
+        for (int s = 0; s < MM_MAX_JPEG_SLOTS; s++) {
+            if (slot[s].assembly) { heap_caps_free(slot[s].assembly); slot[s].assembly = nullptr; }
+        }
+        bool ok = true;
+        for (int s = 0; s < g_numJpegSlots; s++) {
+            slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(
+                16, MAX_TILE_JPEG, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!slot[s].assembly) { ok = false; break; }
+        }
+        if (ok) break;
+        Serial.printf("[WARN] JPEG slots %d failed — retrying with %d\n",
+                      g_numJpegSlots, g_numJpegSlots - 1);
+        g_numJpegSlots--;
+    }
+    if (g_numJpegSlots == 0) {
+        Serial.println("[ERROR] Cannot allocate even 1 JPEG slot — halting");
+        statusLine(2, "Buffers:", "SRAM ALLOC FAILED!", TFT_RED);
+        while (1) delay(1000);
+    }
+    Serial.printf("[MEM] JPEG slots: %d / %d (CFG=%d)\n",
+                  g_numJpegSlots, MM_MAX_JPEG_SLOTS, CFG_NUM_JPEG_SLOTS);
+
+    // ── Display framebuffers (PSRAM) — fallback from CFG down to 2 ───────────
+    // Each buffer is a full 320×240 RGB565 frame (150 KB PSRAM).
+    // Minimum 2 required for tear-free DMA ping-pong.
+    g_numDisplayBufs = CFG_NUM_DISPLAY_BUFS;
+    while (g_numDisplayBufs >= 2) {
+        for (int s = 0; s < MM_MAX_DISPLAY_BUFS; s++) {
+            if (frameFb[s]) { heap_caps_free(frameFb[s]); frameFb[s] = nullptr; }
+        }
+        bool ok = true;
+        for (int s = 0; s < g_numDisplayBufs; s++) {
+            frameFb[s] = (uint16_t*)heap_caps_aligned_alloc(
+                16, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
+            if (!frameFb[s]) { ok = false; break; }
+        }
+        if (ok) break;
+        Serial.printf("[WARN] Display bufs %d failed — retrying with %d\n",
+                      g_numDisplayBufs, g_numDisplayBufs - 1);
+        g_numDisplayBufs--;
+    }
+    if (g_numDisplayBufs < 2) {
+        Serial.println("[ERROR] Cannot allocate 2 display framebuffers — halting");
+        statusLine(2, "Buffers:", "PSRAM ALLOC FAILED!", TFT_RED);
+        while (1) delay(1000);
+    }
+    Serial.printf("[MEM] Display bufs: %d / %d (CFG=%d)\n",
+                  g_numDisplayBufs, MM_MAX_DISPLAY_BUFS, CFG_NUM_DISPLAY_BUFS);
+
+    // ── Tile chunk storage (PSRAM) ────────────────────────────────────────────
     bool allocOk = true;
-    for (int s = 0; s < NUM_SLOTS; s++) {
-        slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(
-            16, MAX_TILE_JPEG, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!slot[s].assembly) {
-            Serial.printf("[ERROR] slot[%d].assembly SRAM alloc failed\n", s);
-            allocOk = false; break;
-        }
-    }
-
-    for (int s = 0; s < 2 && allocOk; s++) {
-        frameFb[s] = (uint16_t*)heap_caps_aligned_alloc(
-            16, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
-        if (!frameFb[s]) {
-            Serial.printf("[ERROR] frameFb[%d] PSRAM alloc failed\n", s);
-            allocOk = false;
-        }
-    }
-
     for (int t = 0; t < NUM_TILES && allocOk; t++) {
         tileChunkStorage[t] = (uint8_t*)heap_caps_malloc(
             (size_t)MAX_TILE_CHUNKS * CHUNK_DATA_SIZE, MALLOC_CAP_SPIRAM);
@@ -264,21 +315,26 @@ void setup() {
         for (int c = 0; c < MAX_TILE_CHUNKS; c++)
             tiles[t].chunkBuf[c] = tileChunkStorage[t] + (size_t)c * CHUNK_DATA_SIZE;
     }
-
     if (!allocOk) {
-        statusLine(2, "Buffers:", "ALLOC FAILED!", TFT_RED);
+        statusLine(2, "Buffers:", "CHUNK ALLOC FAILED!", TFT_RED);
         while (1) delay(1000);
     }
 
     // ── Pipeline sync primitives ──────────────────────────────────────────────
-    decodeQueue  = xQueueCreate(NUM_SLOTS, sizeof(DecodeMsg));
-    displayQueue = xQueueCreate(2, sizeof(DisplayMsg));
-    for (int s = 0; s < NUM_SLOTS; s++) {
+    decodeQueue  = xQueueCreate(g_numJpegSlots,   sizeof(DecodeMsg));
+    displayQueue = xQueueCreate(g_numDisplayBufs,  sizeof(DisplayMsg));
+    for (int s = 0; s < g_numJpegSlots; s++) {
         slotFree[s] = xSemaphoreCreateBinary();
         xSemaphoreGive(slotFree[s]);
     }
 
-    statusLine(2, "Buffers:", "OK (2-frame depth)", TFT_GREEN);
+    {
+        char bufMsg[40];
+        snprintf(bufMsg, sizeof(bufMsg), "J:%d D:%d (max J:%d D:%d)",
+                 g_numJpegSlots, g_numDisplayBufs,
+                 MM_MAX_JPEG_SLOTS, MM_MAX_DISPLAY_BUFS);
+        statusLine(2, "Buffers:", bufMsg, TFT_GREEN);
+    }
 
     Serial.printf("[MEM] free SRAM  : %lu KB / %lu KB\n",
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL)  / 1024,
@@ -355,6 +411,14 @@ void setup() {
     xTaskCreatePinnedToCore(networkTask,     "NetTask",     10240, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(wifiWatchdogTask,"WifiWatchdog", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 2, NULL, 0);
+
+    // ── Per-core CPU utilisation idle hooks ───────────────────────────────────
+    // Core 0 runs NetTask / OTA / displayTask; Core 1 runs loop() (renderer).
+    // Each hook increments its core's idle-tick counter; networkTask computes
+    // CPU% = 100 - (idleDelta * 100 / expectedTicks) over its 400 ms window.
+    esp_register_freertos_idle_hook_for_cpu(idleHookCore0, 0);
+    esp_register_freertos_idle_hook_for_cpu(idleHookCore1, 1);
+
     Serial.println("[OK] Ready.");
 }
 
@@ -456,7 +520,7 @@ void loop() {
             DisplayMsg dmsg = { msg.frameId, writeSet };
             if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
                 g_abortedFrames++;
-            writeSet ^= 1;
+            writeSet = (writeSet + 1) % g_numDisplayBufs;
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;

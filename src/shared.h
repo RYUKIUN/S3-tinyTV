@@ -39,7 +39,37 @@
 static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
 static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 
-#define NUM_SLOTS 4
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MEMORY MANAGEMENT ZONE
+//  Edit CFG_ values to tune pipeline depth / display smoothness.
+//  Allocator in setup() will fall back gracefully if memory is insufficient.
+//
+//  SRAM budget (N16R8): ~300 KB free after boot.
+//    Each JPEG slot costs MAX_TILE_JPEG = 33.6 KB  → 6 slots = ~202 KB
+//  PSRAM budget (N16R8): 8 MB OPI, heap-mapped to ~7.9 MB.
+//    Each display buffer costs 320×240×2 = 150 KB  → 6 buffers = ~900 KB
+//
+//  CFG_NUM_JPEG_SLOTS   (1–6)  — SRAM assembly buffers for tile decode.
+//    More slots → networkTask can queue more tiles without stalling the sender,
+//    reducing ABRT at high JPEG quality.  4 is optimal for a 4-tile / 35 fps stream.
+//
+//  CFG_NUM_DISPLAY_BUFS (2–6)  — PSRAM ping-pong buffers for the display DMA.
+//    Minimum 2 required for tear-free output.  3+ reduces frame drops when
+//    decoding is slower than the display push (e.g. complex scenes at high quality).
+// ═══════════════════════════════════════════════════════════════════════════════
+#define CFG_NUM_JPEG_SLOTS    4   // desired JPEG slots  (1–6)
+#define CFG_NUM_DISPLAY_BUFS  2   // desired display bufs (2–6)
+
+// ── Hard array caps — do NOT exceed ──────────────────────────────────────────
+#define MM_MAX_JPEG_SLOTS     6
+#define MM_MAX_DISPLAY_BUFS   6
+
+// Backward-compat alias (used by legacy code paths that don't need the runtime val)
+#define NUM_SLOTS MM_MAX_JPEG_SLOTS
+
+// ── Runtime actual counts (set by setup() after fallback allocation) ──────────
+extern uint8_t g_numJpegSlots;    // actual slots allocated  (1–MM_MAX_JPEG_SLOTS)
+extern uint8_t g_numDisplayBufs;  // actual display bufs allocated (2–MM_MAX_DISPLAY_BUFS)
 
 // ── Pipeline structs ──────────────────────────────────────────────────────────
 struct PipeSlot {
@@ -75,12 +105,12 @@ struct TileState {
 // ── FreeRTOS handles ──────────────────────────────────────────────────────────
 extern QueueHandle_t     decodeQueue;
 extern QueueHandle_t     displayQueue;
-extern SemaphoreHandle_t slotFree[NUM_SLOTS];
+extern SemaphoreHandle_t slotFree[MM_MAX_JPEG_SLOTS];
 
 // ── Shared buffers ────────────────────────────────────────────────────────────
-extern uint16_t* frameFb[2];
+extern uint16_t* frameFb[MM_MAX_DISPLAY_BUFS];   // only [0..g_numDisplayBufs-1] allocated
 extern uint8_t*  tileChunkStorage[NUM_TILES];
-extern PipeSlot  slot[NUM_SLOTS];
+extern PipeSlot  slot[MM_MAX_JPEG_SLOTS];         // only [0..g_numJpegSlots-1] allocated
 extern TileState tiles[NUM_TILES];
 
 // ── Cross-core stats ──────────────────────────────────────────────────────────
@@ -105,9 +135,14 @@ extern const char* WIFI_SSID;
 extern const char* WIFI_PASS;
 const int UDP_PORT = 12345;
 
+// ── Per-core CPU utilisation (updated by FreeRTOS idle hooks in main.cpp) ─────
+// Counts how many idle-task iterations each core has completed.
+// Network debug task computes delta over its 400 ms stat window to get CPU%.
+extern volatile uint32_t g_cpuIdleTicks[2];
+
 // ── Debug / stats ─────────────────────────────────────────────────────────────
 extern bool  debugEnabled;
-extern char  debugBuf[256];
+extern char  debugBuf[320];   // 320 B: original ~125 B + CPU0/CPU1/extra headroom
 extern int   g_sock;
 extern struct sockaddr_in g_remoteAddr;
 extern bool  g_remoteAddrValid;

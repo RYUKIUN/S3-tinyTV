@@ -292,5 +292,6 @@
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
-  "cmake.sourceDirectory": "D:/PlatformIO/Projects/S3-nextgen jpeg stash/components/esp-dsp"
+  "cmake.sourceDirectory": "D:/PlatformIO/Projects/S3-nextgen jpeg stash/components/esp-dsp",
+  "python-envs.defaultEnvManager": "ms-python.python:system"
 }

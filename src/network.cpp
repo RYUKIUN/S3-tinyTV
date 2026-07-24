@@ -141,7 +141,7 @@ void networkTask(void*) {
             if (len > 0) {
                 DecodeMsg msg = { fId, tId, back, (uint16_t)len };
                 xQueueSend(decodeQueue, &msg, portMAX_DELAY);
-                back = (back + 1) & 3;
+                back = (back + 1) % g_numJpegSlots;
             } else {
                 xSemaphoreGive(slotFree[back]);
             }
@@ -173,14 +173,31 @@ void networkTask(void*) {
             float    tempC     = temperatureRead();
             uint32_t decUs     = g_avgDecodeUs;
 
+            // ── Per-core CPU% ─────────────────────────────────────────────────
+            // FreeRTOS runs at configTICK_RATE_HZ (1000 Hz on ESP32-Arduino),
+            // so in `el` ms we expect `el` ticks per core.
+            // Each idle-hook call ≈ one idle-task iteration; we use the delta
+            // over this 400 ms window as a proxy for idle time.
+            static uint32_t lastIdleTicks[2] = { 0, 0 };
+            uint32_t idleNow0 = g_cpuIdleTicks[0];
+            uint32_t idleNow1 = g_cpuIdleTicks[1];
+            uint32_t idleDelta0 = idleNow0 - lastIdleTicks[0];
+            uint32_t idleDelta1 = idleNow1 - lastIdleTicks[1];
+            lastIdleTicks[0] = idleNow0;
+            lastIdleTicks[1] = idleNow1;
+            uint32_t ticks = (el > 0) ? el : 1;
+            uint32_t cpu0 = (idleDelta0 >= ticks) ? 0 : (100 - (idleDelta0 * 100 / ticks));
+            uint32_t cpu1 = (idleDelta1 >= ticks) ? 0 : (100 - (idleDelta1 * 100 / ticks));
+
             snprintf(debugBuf, sizeof(debugBuf),
                 "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"
-                "|SRAM:%lu/%lu|PSRAM:%lu/%lu",
+                "|SRAM:%lu/%lu|PSRAM:%lu/%lu|CPU0:%lu|CPU1:%lu",
                 0xAB, 0xCD,
                 fps, tempC, stat_jitter,
                 decUs, totalDrop, aborted,
                 freeSRAM / 1024, totalSRAM / 1024,
-                freePSR  / 1024, totalPSR  / 1024);
+                freePSR  / 1024, totalPSR  / 1024,
+                cpu0, cpu1);
 
             sendto(g_sock, debugBuf, strlen(debugBuf), 0,
                    (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
