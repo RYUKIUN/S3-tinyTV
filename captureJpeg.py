@@ -193,6 +193,18 @@ def _diag_color(val_str, warn, err, reverse=False):
     except: pass
     return (0, 255, 0)
 
+def _mem_color(free_total_str):
+    """Color code a 'free/total' KB string by free-memory percentage.
+       Green ≥ 30 % free | Orange 15–30 % | Red < 15 %."""
+    try:
+        parts = free_total_str.split('/')
+        free, total = int(parts[0]), int(parts[1])
+        pct = free * 100 // total if total > 0 else 100
+        if pct < 15:  return (0,   0, 255)   # red
+        if pct < 30:  return (0, 165, 255)   # orange
+    except: pass
+    return (0, 255, 0)                        # green
+
 # ─────────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────────
@@ -301,6 +313,8 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
                 pkts_per = (per_tile + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
                 size_col = (0, 0, 255) if last_frame_bytes > magic_threshold else (0, 255, 0)
 
+                sram_str  = latest_esp_stats.get('SRAM',  '?/?')
+                psram_str = latest_esp_stats.get('PSRAM', '?/?')
                 dashboard = [
                     (f"FPS  : {latest_esp_stats.get('FPS', '?'):>8}", _diag_color(latest_esp_stats.get('FPS', '0'), 20, 15, True)),
                     (f"TEMP : {latest_esp_stats.get('TEMP', '?'):>7} C", _diag_color(latest_esp_stats.get('TEMP', '0'), 70, 85)),
@@ -309,8 +323,12 @@ def stream_mss_udp(target_ip: str, monitor_idx: int, monitor_info: dict):
                     (f"DROP : {latest_esp_stats.get('DROP', '?'):>8}", _diag_color(latest_esp_stats.get('DROP', '0'), 1, 5)),
                     (f"CPU0 : {latest_esp_stats.get('CPU0', '?'):>7} %", _diag_color(latest_esp_stats.get('CPU0', '0'), 85, 95)),
                     (f"CPU1 : {latest_esp_stats.get('CPU1', '?'):>7} %", _diag_color(latest_esp_stats.get('CPU1', '0'), 85, 95)),
+                    # SRAM/PSRAM: ESP sends "free/total" in KB; green ≥30% free,
+                    # orange <30%, red <15%.
+                    (f"SRAM : {sram_str:>8} KB", _mem_color(sram_str)),
+                    (f"PSRAM: {psram_str:>8} KB", _mem_color(psram_str)),
                     (f"RAW  : {last_frame_bytes:>8} B", size_col),
-                    (f"AVG  : {int(ema_avg_bytes):>8} B", (255, 200, 0)), # สีฟ้าอ่อนแสดงค่าเฉลี่ย
+                    (f"AVG  : {int(ema_avg_bytes):>8} B", (255, 200, 0)),
                     (f"QUAL : {current_qual:>8} (Max {user_max_qual})", (0, 255, 255)),
                     (f"SUB  : {sub_str:>8}", (200, 200, 200)),
                 ]

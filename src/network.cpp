@@ -174,20 +174,22 @@ void networkTask(void*) {
             uint32_t decUs     = g_avgDecodeUs;
 
             // ── Per-core CPU% ─────────────────────────────────────────────────
-            // FreeRTOS runs at configTICK_RATE_HZ (1000 Hz on ESP32-Arduino),
-            // so in `el` ms we expect `el` ticks per core.
-            // Each idle-hook call ≈ one idle-task iteration; we use the delta
-            // over this 400 ms window as a proxy for idle time.
-            static uint32_t lastIdleTicks[2] = { 0, 0 };
-            uint32_t idleNow0 = g_cpuIdleTicks[0];
-            uint32_t idleNow1 = g_cpuIdleTicks[1];
-            uint32_t idleDelta0 = idleNow0 - lastIdleTicks[0];
-            uint32_t idleDelta1 = idleNow1 - lastIdleTicks[1];
-            lastIdleTicks[0] = idleNow0;
-            lastIdleTicks[1] = idleNow1;
-            uint32_t ticks = (el > 0) ? el : 1;
-            uint32_t cpu0 = (idleDelta0 >= ticks) ? 0 : (100 - (idleDelta0 * 100 / ticks));
-            uint32_t cpu1 = (idleDelta1 >= ticks) ? 0 : (100 - (idleDelta1 * 100 / ticks));
+            // g_cpuIdleUs[n] accumulates microseconds the idle task actually
+            // ran on core n (set by idle hooks in main.cpp).
+            // totalUs = window duration in µs; same units as the accumulator.
+            // CPU% = 100 - (idleUs / totalUs * 100)  — clipped to [0,100].
+            static uint32_t lastIdleUs[2] = { 0, 0 };
+            uint32_t idleNow0   = g_cpuIdleUs[0];
+            uint32_t idleNow1   = g_cpuIdleUs[1];
+            uint32_t idleDelta0 = idleNow0 - lastIdleUs[0];
+            uint32_t idleDelta1 = idleNow1 - lastIdleUs[1];
+            lastIdleUs[0] = idleNow0;
+            lastIdleUs[1] = idleNow1;
+            uint32_t totalUs = el * 1000u;   // el is ms → convert to µs
+            uint32_t cpu0 = (totalUs == 0 || idleDelta0 >= totalUs)
+                            ? 0 : (100u - idleDelta0 * 100u / totalUs);
+            uint32_t cpu1 = (totalUs == 0 || idleDelta1 >= totalUs)
+                            ? 0 : (100u - idleDelta1 * 100u / totalUs);
 
             snprintf(debugBuf, sizeof(debugBuf),
                 "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"

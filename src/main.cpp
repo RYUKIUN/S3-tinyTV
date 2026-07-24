@@ -97,12 +97,48 @@ QueueHandle_t displayQueue;      // depth = g_numDisplayBufs
 // ─────────────────────────────────────────────
 //  PER-CORE CPU UTILISATION (TASK 1)
 // ─────────────────────────────────────────────
-// Incremented by idle hooks — one count per idle-task iteration per core.
-// Network debug task reads 400 ms deltas and computes CPU% from tick rate.
-volatile uint32_t g_cpuIdleTicks[2] = { 0, 0 };
+// The idle hook fires in a tight loop inside the FreeRTOS idle task — it can
+// be called tens of thousands of times per second, NOT once per tick.  So the
+// old "count iterations vs tick count" formula always evaluated idle >> ticks
+// and pinned CPU% at 0.
+//
+// Fix: accumulate ACTUAL MICROSECONDS of idle time using esp_timer_get_time().
+// s_idleLastUs[] tracks the timestamp of the previous hook call for each core.
+// If consecutive calls are < IDLE_GAP_THRESH_US apart, the idle task ran
+// uninterrupted — add the delta as genuine idle time.
+// If the gap is ≥ thresh, a real task preempted the idle task in between —
+// don't count that gap, only reset the baseline.
+//
+// g_cpuIdleUs[] is read by networkTask (Core 0) and written by idle hooks.
+// Core 0's hook writes index [0] from the same core as networkTask — no
+// simultaneous write+read since idle priority < networkTask priority.
+// Core 1's hook writes index [1] read cross-core; uint32_t reads are atomic
+// on Xtensa, and volatile ensures no stale cache.
 
-static bool IRAM_ATTR idleHookCore0() { g_cpuIdleTicks[0]++; return false; }
-static bool IRAM_ATTR idleHookCore1() { g_cpuIdleTicks[1]++; return false; }
+#define IDLE_GAP_THRESH_US  1000u   // 1 ms — one FreeRTOS tick
+
+volatile uint32_t g_cpuIdleUs[2] = { 0, 0 };
+
+// Per-core last-call timestamps: written and read only from their own core.
+static uint32_t IRAM_ATTR s_idleLastUs[2] = { 0, 0 };
+
+static bool IRAM_ATTR idleHookCore0() {
+    uint32_t now  = (uint32_t)esp_timer_get_time();
+    uint32_t last = s_idleLastUs[0];
+    s_idleLastUs[0] = now;
+    if (last && (now - last) < IDLE_GAP_THRESH_US)
+        g_cpuIdleUs[0] += (now - last);
+    return false;
+}
+
+static bool IRAM_ATTR idleHookCore1() {
+    uint32_t now  = (uint32_t)esp_timer_get_time();
+    uint32_t last = s_idleLastUs[1];
+    s_idleLastUs[1] = now;
+    if (last && (now - last) < IDLE_GAP_THRESH_US)
+        g_cpuIdleUs[1] += (now - last);
+    return false;
+}
 
 // ─────────────────────────────────────────────
 //  CHUNK REASSEMBLY STATE DEFINITIONS

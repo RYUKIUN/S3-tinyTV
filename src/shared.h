@@ -136,9 +136,12 @@ extern const char* WIFI_PASS;
 const int UDP_PORT = 12345;
 
 // ── Per-core CPU utilisation (updated by FreeRTOS idle hooks in main.cpp) ─────
-// Counts how many idle-task iterations each core has completed.
-// Network debug task computes delta over its 400 ms stat window to get CPU%.
-extern volatile uint32_t g_cpuIdleTicks[2];
+// Accumulates actual microseconds the idle task spent running on each core.
+// Between consecutive idle-hook calls that are <1 ms apart (idle task running
+// continuously), the elapsed µs are added.  If the gap is ≥1 ms a real task
+// preempted — that gap is NOT counted as idle time.
+// Network debug task divides window idle-µs by total-µs to get CPU%.
+extern volatile uint32_t g_cpuIdleUs[2];
 
 // ── Debug / stats ─────────────────────────────────────────────────────────────
 extern bool  debugEnabled;
