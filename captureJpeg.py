@@ -450,12 +450,17 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             else:
                 ema_avg_bytes = (EMA_ALPHA * last_frame_bytes) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
 
-            upper_bound = magic_threshold * 1
             lower_bound = magic_threshold * 0.90
 
-            if ema_avg_bytes > upper_bound:
-                current_qual = max(5, current_qual - 2)
+            if last_frame_bytes > magic_threshold:
+                # Hard/instant drop: THIS frame actually blew the threshold —
+                # react now on the raw size, don't wait for the EMA to catch
+                # up (by the time it does, the ESP has already stalled on it
+                # and the backlog bleeds into the following frames too).
+                current_qual = max(5, current_qual - 6)
             elif ema_avg_bytes < lower_bound:
+                # Gentle climb back up once comfortably under threshold,
+                # smoothed via EMA so quality doesn't flicker up and down.
                 current_qual = min(user_max_qual, current_qual + 1)
             # ─────────────────────────────────────────────
 
