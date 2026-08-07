@@ -64,6 +64,7 @@
 #include "jpeg_decode.h"
 #include "offline_player.h"
 #include "esp_freertos_hooks.h"
+#include <cstring>
 
 
 // ─────────────────────────────────────────────
@@ -157,6 +158,10 @@ volatile uint32_t g_wifiDisconnectedMs = 0; // millis() when WiFi last disconnec
 
 // ── Offline mode ──────────────────────────────────────────────────────────────
 volatile bool g_offlineMode = false;   // set by enterOfflineMode(), never cleared
+
+// Forward decl — defined after setup() (was the body of Arduino loop());
+// setup() needs it to spin the task up.
+static void decodeTask(void*);
 
 
 // ─────────────────────────────────────────────
@@ -397,8 +402,13 @@ void setup() {
             // Attempt offline mode
             if (initOfflinePlayer()) {
                 enterOfflineMode();
-                // loop() will call runOfflinePlayer() — skip task creation
-                return;
+                // Everything is task-based now — there's no loop() to hand
+                // this off to. runOfflinePlayer() never returns, so calling
+                // it here (still inside the setup task, before it would
+                // otherwise self-delete below) is equivalent and simpler
+                // than spinning up a task just to immediately block forever.
+                runOfflinePlayer();
+                return;   // unreachable — satisfies the compiler
             }
             // No files either → restart and try again
             statusLine(3, "WiFi:", "No offline files — restart", TFT_RED);
@@ -432,14 +442,24 @@ void setup() {
     xTaskCreatePinnedToCore(wifiWatchdogTask,"WifiWatchdog", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 2, NULL, 0);
 
+    // ── Decode task (was Arduino loop()) ──────────────────────────────────────
+    // Same 8 KB the Arduino loop task used to run on, same core (Core 1),
+    // now an explicit named task instead of the framework's implicit one.
+    xTaskCreatePinnedToCore(decodeTask,      "DecodeTask",   8192, NULL, 2, NULL, 1);
+
     // ── Per-core CPU utilisation idle hooks ───────────────────────────────────
-    // Core 0 runs NetTask / OTA / displayTask; Core 1 runs loop() (renderer).
+    // Core 0 runs NetTask / OTA / displayTask; Core 1 runs DecodeTask.
     // Each hook increments its core's idle-tick counter; networkTask computes
     // CPU% = 100 - (idleDelta * 100 / expectedTicks) over its 400 ms window.
     esp_register_freertos_idle_hook_for_cpu(idleHookCore0, 0);
     esp_register_freertos_idle_hook_for_cpu(idleHookCore1, 1);
 
     Serial.println("[OK] Ready.");
+
+    // Everything from here on runs in dedicated tasks. This setup task
+    // (the Arduino "loop task") has nothing left to do — delete it and
+    // reclaim its 8 KB stack instead of leaving it idling in an empty loop().
+    vTaskDelete(NULL);
 }
 
 
@@ -540,7 +560,25 @@ void loop() {
             DisplayMsg dmsg = { msg.frameId, writeSet };
             if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
                 g_abortedFrames++;
+
+            uint8_t justCompleted = writeSet;
             writeSet = (writeSet + 1) % g_numDisplayBufs;
+
+            // Seed the next write buffer with the frame we just finished,
+            // before any tile of the upcoming frame gets decoded into it.
+            // Without this, a tile that fails mid-decode (corrupt/truncated
+            // bitstream) or never arrives in time (network/decode
+            // backpressure) leaves whatever partial MCU rows/garbage was
+            // last written there — visible as torn/"shredded" blocks.
+            // With the seed, a stalled tile falls back to the last good
+            // frame's pixels instead: stale at worst, never garbage.
+            // Safe to overwrite here — same assumption the original 2-buffer
+            // design already relied on (decode is Core-1 exclusive between
+            // writeSet flips, and by the time writeSet cycles back to this
+            // index displayTask's DMA out of it has long since finished).
+            memcpy(frameFb[writeSet], frameFb[justCompleted],
+                   (size_t)SCREEN_W * SCREEN_H * 2);
+
             readyMask    = 0;
             pendingFrame = 0xFF;
             frameStartMs = 0;

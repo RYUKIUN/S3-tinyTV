@@ -122,7 +122,16 @@ void networkTask(void*) {
         if (fId != ts.frameId) {
             resetTile(tId);
             ts.frameId      = fId;
-            ts.totalChunks  = nChunks;
+            // Clamp: nChunks comes straight off the wire (untrusted). The
+            // sender already caps every tile under MAX_TILE_JPEG bytes
+            // (captureJpeg.py send_tiles(), MAX_TILE_JPEG check) which by
+            // construction keeps num_chunks <= MAX_TILE_CHUNKS — but that's
+            // an invariant enforced on the *other* device. If it's ever
+            // violated (bit error, desync, future sender change), an
+            // unclamped totalChunks here would drive assembleTileInto()'s
+            // loop past the end of chunkGot[]/chunkBuf[]/chunkLen[]
+            // (MAX_TILE_CHUNKS entries) and memcpy from garbage pointers.
+            ts.totalChunks  = (nChunks > MAX_TILE_CHUNKS) ? MAX_TILE_CHUNKS : nChunks;
             ts.frameSize    = fSize;
             ts.firstChunkMs = millis();
         }

@@ -43,7 +43,7 @@ static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 //    decoding is slower than the display push (e.g. complex scenes at high quality).
 // ═══════════════════════════════════════════════════════════════════════════════
 #define CFG_NUM_JPEG_SLOTS    4   // desired JPEG slots  (1–6)
-#define CFG_NUM_DISPLAY_BUFS  2   // desired display bufs (2–6)
+#define CFG_NUM_DISPLAY_BUFS  3   // desired display bufs (2–6)
 
 // ── Hard array caps — do NOT exceed ──────────────────────────────────────────
 #define MM_MAX_JPEG_SLOTS     6

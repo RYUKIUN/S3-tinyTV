@@ -18,7 +18,7 @@ PORT         = 12345
 ESP_W, ESP_H = 320, 240          
 
 # Magic thresholds for auto-quality
-MAGIC_420 = 17500
+MAGIC_420 = 25000
 MAGIC_444 = 17000
 
 # EMA Settings (Low-pass filter for bitrate)
