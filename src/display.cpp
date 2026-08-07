@@ -43,23 +43,6 @@ void displayTask(void*) {
     uint32_t lastOverlayMs = 0;
 
     while (true) {
-        // ── Offline-mode shutdown ─────────────────────────────────────────────
-        // offlinePlayerTask calls lcd.pushImage() directly from Core 1.
-        // displayTask must exit before that starts to avoid concurrent LCD access.
-        // enterOfflineMode() waits 500 ms after setting this flag, giving us
-        // plenty of time to reach this check and self-delete.
-        if (g_offlineMode) {
-            if (dmaPending) {
-                lcd.waitDMA();
-                lcd.endWrite();
-                dmaPending = false;
-            }
-            Serial.println("[DISP] Offline mode — displayTask exiting");
-            esp_task_wdt_delete(NULL);
-            vTaskDelete(NULL);
-            return;
-        }
-
         // ── Poll DMA completion — yield cooperatively while busy ──────────────
         // pushPixelsDMA returns immediately; we loop here with taskYIELD() so
         // the IDLE task (and other tasks) keep getting CPU time, which also feeds

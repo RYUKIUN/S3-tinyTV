@@ -59,16 +59,6 @@ void networkTask(void*) {
     uint8_t back = 0;
 
     while (true) {
-        // ── Offline-mode shutdown ─────────────────────────────────────────────
-        // enterOfflineMode() sets g_offlineMode then closes g_sock.
-        // We may still be in recvfrom / select; check here on each wakeup.
-        if (g_offlineMode) {
-            if (g_sock >= 0) { close(g_sock); g_sock = -1; }
-            Serial.println("[NET] Offline mode — networkTask exiting");
-            vTaskDelete(NULL);
-            return;
-        }
-
         int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
                          (struct sockaddr*)&sender, &slen);
 
@@ -227,13 +217,6 @@ void wifiWatchdogTask(void*) {
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(250));
-
-        // ── Offline-mode shutdown ─────────────────────────────────────────────
-        if (g_offlineMode) {
-            Serial.println("[WATCHDOG] Offline mode — wifiWatchdogTask exiting");
-            vTaskDelete(NULL);
-            return;
-        }
 
         bool connected = (WiFi.status() == WL_CONNECTED);
         g_wifiOk = connected;

@@ -17,12 +17,9 @@
 #define PKT_TIMEOUT_MS   3000
 #define OVERLAY_FLASH_MS 1000
 
-// ── Offline-mode timeouts ─────────────────────────────────────────────────────
-// How long to wait for WiFi association before giving up and going offline.
+// ── WiFi association timeout ──────────────────────────────────────────────────
+// How long to wait for WiFi association before restarting and retrying.
 #define WIFI_CONNECT_TIMEOUT_MS  150000
-// How long after WiFi connects with no stream packet before going offline.
-// Gives the PC sender time to discover the ESP via beacon.
-#define OFFLINE_TRIGGER_MS       500000
 
 // ── Display geometry ──────────────────────────────────────────────────────────
 #define SCREEN_W         320
@@ -108,12 +105,6 @@ extern volatile bool     g_streaming;        // true once first tile decoded
 extern volatile bool     g_wifiOk;           // mirrors WiFi.status() == WL_CONNECTED
 extern volatile uint32_t g_lastPktMs;        // updated by networkTask on each valid UDP packet
 extern volatile uint32_t g_wifiConnectedMs;  // millis() when WiFi first associated
-
-// ── Offline mode flag ─────────────────────────────────────────────────────────
-// Set true by enterOfflineMode() in main.cpp.  All streaming tasks check this
-// on each iteration and call vTaskDelete(NULL) when they see it set.
-// Once set, never cleared — offline mode persists until reboot.
-extern volatile bool g_offlineMode;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 extern const char* WIFI_SSID;

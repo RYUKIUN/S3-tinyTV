@@ -22,26 +22,8 @@
  *
  *  Total SRAM for buffers: ~66 KB (was ~104 KB before removing decodeTemp)
  *
- * OFFLINE MODE
- * ────────────
- *  Trigger: WiFi connected but no stream packet received within OFFLINE_TRIGGER_MS (5 s).
- *           OR: WiFi fails to associate within WIFI_CONNECT_TIMEOUT_MS (15 s).
- *
- *  Behaviour:
- *   1. enterOfflineMode() — sets g_offlineMode, tears down WiFi, drops CPU to 80 MHz.
- *   2. All streaming tasks (networkTask, wifiWatchdogTask, displayTask, otaTask) see
- *      g_offlineMode on their next iteration and call vTaskDelete(NULL).
- *   3. 500 ms grace period for tasks to exit before LCD is claimed by the player.
- *   4. runOfflinePlayer() — called from decodeTask (Core 1, was Arduino loop());
- *      loops forever. Scans SPIFFS for .mjpeg files, plays them in sequence,
- *      cycles on end. (If offline mode is entered during setup(), before
- *      decodeTask exists, setup() calls it directly instead.)
- *
- *  Power savings in offline mode:
- *   • WiFi radio completely off  (WiFi.mode(WIFI_OFF) + esp_wifi_stop())
- *   • CPU frequency 240 → 80 MHz
- *   • No FreeRTOS tasks except the idle task and decodeTask itself
- *   • vTaskDelay() used for frame pacing — Core idle between frames
+ *  If WiFi never associates within WIFI_CONNECT_TIMEOUT_MS, the ESP just
+ *  restarts and tries again (no offline/local-playback fallback anymore).
  */
 #include <LovyanGFX.hpp>
 #include <JPEGDEC.h>
@@ -51,7 +33,6 @@
 #include <esp_wifi.h>
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
-#include <SPIFFS.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -64,7 +45,6 @@
 #include "display.h"
 #include "network.h"
 #include "jpeg_decode.h"
-#include "offline_player.h"
 #include "esp_freertos_hooks.h"
 #include <cstring>
 
@@ -158,9 +138,6 @@ volatile uint32_t g_lastPktMs        = 0;
 volatile uint32_t g_wifiConnectedMs  = 0;   // millis() when WiFi first associated
 volatile uint32_t g_wifiDisconnectedMs = 0; // millis() when WiFi last disconnected
 
-// ── Offline mode ──────────────────────────────────────────────────────────────
-volatile bool g_offlineMode = false;   // set by enterOfflineMode(), never cleared
-
 // Forward decl — defined after setup() (was the body of Arduino loop());
 // setup() needs it to spin the task up.
 static void decodeTask(void*);
@@ -197,64 +174,9 @@ static void otaTask(void* /*pv*/) {
                   WiFi.localIP().toString().c_str());
 
     for (;;) {
-        // Self-terminate when offline mode is active (WiFi is off, OTA is useless)
-        if (g_offlineMode) {
-            Serial.println("[OTA] Offline mode — otaTask exiting");
-            vTaskDelete(NULL);
-            return;
-        }
         ArduinoOTA.handle();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-}
-
-// ─────────────────────────────────────────────
-//  ENTER OFFLINE MODE
-//  Can be called from setup() (no tasks running) or loop() (tasks running).
-//  Sets g_offlineMode so all tasks self-terminate, then kills WiFi and
-//  reduces the CPU frequency for power saving.
-//  After this returns, call runOfflinePlayer() (which never returns).
-// ─────────────────────────────────────────────
-static void enterOfflineMode() {
-    Serial.println("[OFFLINE] Entering offline mode");
-
-    // 1. Signal all streaming tasks to stop.
-    //    They poll g_offlineMode on each iteration and call vTaskDelete(NULL).
-    g_offlineMode = true;
-
-    // 2. Close the UDP socket so networkTask's recvfrom() / select() unblocks
-    //    immediately rather than waiting on its 1 ms timeout.
-    if (g_sock >= 0) {
-        close(g_sock);
-        g_sock = -1;
-    }
-
-    // 3. Give tasks up to 500 ms to see the flag and exit.
-    //    displayTask has a 100 ms xQueueReceive timeout, so it will exit
-    //    within that window.  networkTask unblocks immediately from the closed
-    //    socket.  This prevents concurrent LCD access between displayTask and
-    //    runOfflinePlayer().
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 4. Shut WiFi hardware down completely.
-    WiFi.disconnect(true);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    esp_wifi_stop();
-    WiFi.mode(WIFI_OFF);
-    g_wifiOk = false;
-    Serial.println("[OFFLINE] WiFi radio OFF");
-
-    // 5. Reduce CPU frequency: 240 → 80 MHz.
-    //    Halves dynamic power consumption; 80 MHz is plenty for SPIFFS reads
-    //    and JPEGDEC at 15 fps.
-    setCpuFrequencyMhz(160);
-    Serial.printf("[OFFLINE] CPU frequency: %d MHz\n", getCpuFrequencyMhz());
-
-    // 6. Update status display.
-    statusLine(3, "WiFi:", "OFF (power save)", TFT_YELLOW);
-    statusLine(4, "OTA:", "Disabled",          TFT_DARKGREY);
-    statusLine(5, "Mode:", "OFFLINE PLAYER",   TFT_CYAN);
-    statusLine(6, "Status:", "Loading...",     TFT_YELLOW);
 }
 
 
@@ -370,13 +292,6 @@ void setup() {
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM)  / 1024,
         heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
 
-    // ── SPIFFS — mounted now so initOfflinePlayer() is available later ────────
-    // The partition table (partitions_16MB_ota.csv) must include a spiffs entry.
-    // Use PlatformIO "Upload Filesystem Image" to upload .mjpeg files.
-    // Mount failure is non-fatal here; offline mode will report no files found.
-    bool spiffsOk = SPIFFS.begin(false);
-    Serial.printf("[SPIFFS] %s\n", spiffsOk ? "mounted OK" : "mount failed (no SPIFFS partition?)");
-
     // ── WiFi — try for up to WIFI_CONNECT_TIMEOUT_MS ─────────────────────────
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
     WiFi.mode(WIFI_STA);
@@ -398,22 +313,8 @@ void setup() {
         statusLine(3, "WiFi:", buf, TFT_YELLOW);
 
         if (millis() - ws > WIFI_CONNECT_TIMEOUT_MS) {
-            Serial.println("[WIFI] Association timeout");
-            statusLine(3, "WiFi:", "Timeout", TFT_RED);
-
-            // Attempt offline mode
-            if (initOfflinePlayer()) {
-                enterOfflineMode();
-                // Everything is task-based now — there's no loop() to hand
-                // this off to. runOfflinePlayer() never returns, so calling
-                // it here (still inside the setup task, before it would
-                // otherwise self-delete below) is equivalent and simpler
-                // than spinning up a task just to immediately block forever.
-                runOfflinePlayer();
-                return;   // unreachable — satisfies the compiler
-            }
-            // No files either → restart and try again
-            statusLine(3, "WiFi:", "No offline files — restart", TFT_RED);
+            Serial.println("[WIFI] Association timeout — restarting");
+            statusLine(3, "WiFi:", "Timeout — restart", TFT_RED);
             delay(3000);
             ESP.restart();
         }
@@ -422,7 +323,7 @@ void setup() {
     wifiConnected = true;
     esp_wifi_set_ps(WIFI_PS_NONE);
     g_wifiOk = true;
-    g_wifiConnectedMs = millis();   // start the offline-trigger countdown
+    g_wifiConnectedMs = millis();
 
     String ip = WiFi.localIP().toString();
     char ipBuf[36];
@@ -431,9 +332,6 @@ void setup() {
     statusLine(5, "Mode:",   "Wireless display",  TFT_CYAN);
     statusLine(6, "Status:", "Waiting for PC...", TFT_YELLOW);
     Serial.printf("[OK] WiFi: %s\n", ip.c_str());
-
-    // Pre-scan SPIFFS so initOfflinePlayer is fast if needed later
-    initOfflinePlayer();
 
     // ── OTA ───────────────────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(otaTask, "OTA", 8192, NULL, 1, NULL, 0);
@@ -486,44 +384,6 @@ static void decodeTask(void*) {
     uint32_t lastIv = 0;
 
     for (;;) {
-
-        // ── Offline mode: hand Core 1 to the MJPEG player forever ────────────
-        // runOfflinePlayer() is an infinite loop; it never returns.
-        // Reaching this means enterOfflineMode() was called and all streaming
-        // tasks have (or are in the process of) self-terminating.
-        if (g_offlineMode) {
-            runOfflinePlayer();
-            vTaskDelete(NULL);
-            return;   // unreachable — satisfies the compiler
-        }
-
-        // ── Offline-trigger watchdog ──────────────────────────────────────────
-        // If WiFi is up but no stream packet has arrived within
-        // OFFLINE_TRIGGER_MS of WiFi association, switch to offline mode.
-        // g_wifiConnectedMs is set when WiFi first connects in setup().
-        // g_streaming becomes true when the first tile is decoded.
-        if (!g_streaming
-            && g_wifiOk
-            && g_wifiConnectedMs > 0
-            && (millis() - g_wifiConnectedMs) > OFFLINE_TRIGGER_MS) {
-
-            Serial.println("[MAIN] No stream after 5 s — checking for offline files...");
-            // initOfflinePlayer() was called speculatively in setup(); s_fileCount is ready.
-            enterOfflineMode();
-            // Next iteration hits the g_offlineMode branch above and starts playback.
-            continue;
-        }
-
-        // ── WiFi disconnection watchdog ───────────────────────────────────────
-        // If WiFi is disconnected for more than 10 seconds, enter offline mode.
-        if (!g_wifiOk
-            && g_wifiDisconnectedMs > 0
-            && (millis() - g_wifiDisconnectedMs) > 10000) {
-
-            Serial.println("[MAIN] WiFi disconnected for 10 s — entering offline mode");
-            enterOfflineMode();
-            continue;
-        }
 
         // ── Normal streaming decode path ────────────────────────────────────────
         DecodeMsg msg;
