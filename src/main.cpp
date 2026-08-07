@@ -32,13 +32,15 @@
  *   2. All streaming tasks (networkTask, wifiWatchdogTask, displayTask, otaTask) see
  *      g_offlineMode on their next iteration and call vTaskDelete(NULL).
  *   3. 500 ms grace period for tasks to exit before LCD is claimed by the player.
- *   4. runOfflinePlayer() — called from Arduino loop() (Core 1); loops forever.
- *      Scans SPIFFS for .mjpeg files, plays them in sequence, cycles on end.
+ *   4. runOfflinePlayer() — called from decodeTask (Core 1, was Arduino loop());
+ *      loops forever. Scans SPIFFS for .mjpeg files, plays them in sequence,
+ *      cycles on end. (If offline mode is entered during setup(), before
+ *      decodeTask exists, setup() calls it directly instead.)
  *
  *  Power savings in offline mode:
  *   • WiFi radio completely off  (WiFi.mode(WIFI_OFF) + esp_wifi_stop())
  *   • CPU frequency 240 → 80 MHz
- *   • No FreeRTOS tasks except the idle task and loop() itself
+ *   • No FreeRTOS tasks except the idle task and decodeTask itself
  *   • vTaskDelay() used for frame pacing — Core idle between frames
  */
 #include <LovyanGFX.hpp>
@@ -464,136 +466,153 @@ void setup() {
 
 
 // ─────────────────────────────────────────────
-//  MAIN LOOP  (Core 1 — renderer)
+//  DECODE TASK  (Core 1) — formerly Arduino loop()
+//  Everything below used to be one loop() iteration; the Arduino framework
+//  called it repeatedly forever. Now it's an explicit task with its own
+//  for(;;), created in setup() and pinned to Core 1 same as before — the
+//  only behavioral difference is this task has a name FreeRTOS/debuggers
+//  can see, instead of being the anonymous implicit loop task.
 // ─────────────────────────────────────────────
-void loop() {
+static void decodeTask(void*) {
 
-    // ── Offline mode: hand Core 1 to the MJPEG player forever ────────────────
-    // runOfflinePlayer() is an infinite loop; it never returns.
-    // Reaching this point means enterOfflineMode() was called and all streaming
-    // tasks have (or are in the process of) self-terminating.
-    if (g_offlineMode) {
-        runOfflinePlayer();
-        return;   // unreachable — satisfies the compiler
-    }
+    bool     streamStarted = false;
+    uint32_t decodeAcc     = 0;
+    uint32_t decodeCount   = 0;
 
-    // ── Offline-trigger watchdog ───────────────────────────────────────────────
-    // If WiFi is up but no stream packet has arrived within OFFLINE_TRIGGER_MS
-    // of WiFi association, switch to offline mode.
-    // g_wifiConnectedMs is set when WiFi first connects in setup().
-    // g_streaming becomes true when the first tile is decoded.
-    if (!g_streaming
-        && g_wifiOk
-        && g_wifiConnectedMs > 0
-        && (millis() - g_wifiConnectedMs) > OFFLINE_TRIGGER_MS) {
+    uint8_t  pendingFrame = 0xFF;
+    uint8_t  readyMask    = 0;
+    uint32_t frameStartMs = 0;
 
-        Serial.println("[MAIN] No stream after 5 s — checking for offline files...");
-        // initOfflinePlayer() was called speculatively in setup(); s_fileCount is ready.
-        enterOfflineMode();
-        // Next call to loop() hits the g_offlineMode branch above and starts playback. 
-        return;
-    }
+    uint32_t lastIv = 0;
 
-    // ── WiFi disconnection watchdog ───────────────────────────────────────────
-    // If WiFi is disconnected for more than 10 seconds, enter offline mode.
-    if (!g_wifiOk
-        && g_wifiDisconnectedMs > 0
-        && (millis() - g_wifiDisconnectedMs) > 10000) {
+    for (;;) {
 
-        Serial.println("[MAIN] WiFi disconnected for 10 s — entering offline mode");
-        enterOfflineMode();
-        return;
-    }
-
-    // ── Normal streaming decode path ──────────────────────────────────────────
-    static bool     streamStarted = false;
-    static uint32_t decodeAcc     = 0;
-    static uint32_t decodeCount   = 0;
-
-    static uint8_t  pendingFrame = 0xFF;
-    static uint8_t  readyMask    = 0;
-    static uint32_t frameStartMs = 0;
-
-    DecodeMsg msg;
-    if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) return;
-
-    if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
-        pendingFrame = 0xFF;
-        readyMask    = 0;
-        frameStartMs = 0;
-    }
-
-    if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
-        if (pendingFrame != 0xFF && readyMask != 0)
-            g_abortedFrames++;
-        pendingFrame = msg.frameId;
-        readyMask    = 0;
-        frameStartMs = millis();
-    }
-
-    uint32_t decUs = 0;
-    bool ok = decodeSlot(msg, decUs);
-
-    xSemaphoreGive(slotFree[msg.slotIdx]);
-
-    if (ok) {
-        tiles[msg.tId].stat_decoded++;
-        decodeAcc   += decUs;
-        decodeCount++;
-
-        readyMask |= (uint8_t)(1u << msg.tId);
-
-        if (decodeCount >= 16) {
-            g_avgDecodeUs = decodeAcc / decodeCount;
-            decodeAcc = 0; decodeCount = 0;
+        // ── Offline mode: hand Core 1 to the MJPEG player forever ────────────
+        // runOfflinePlayer() is an infinite loop; it never returns.
+        // Reaching this means enterOfflineMode() was called and all streaming
+        // tasks have (or are in the process of) self-terminating.
+        if (g_offlineMode) {
+            runOfflinePlayer();
+            vTaskDelete(NULL);
+            return;   // unreachable — satisfies the compiler
         }
 
-        if (!streamStarted) {
-            streamStarted = true;
-            g_streaming   = true;
-            g_lastPktMs   = millis();
-            statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
-            delay(200);
+        // ── Offline-trigger watchdog ──────────────────────────────────────────
+        // If WiFi is up but no stream packet has arrived within
+        // OFFLINE_TRIGGER_MS of WiFi association, switch to offline mode.
+        // g_wifiConnectedMs is set when WiFi first connects in setup().
+        // g_streaming becomes true when the first tile is decoded.
+        if (!g_streaming
+            && g_wifiOk
+            && g_wifiConnectedMs > 0
+            && (millis() - g_wifiConnectedMs) > OFFLINE_TRIGGER_MS) {
+
+            Serial.println("[MAIN] No stream after 5 s — checking for offline files...");
+            // initOfflinePlayer() was called speculatively in setup(); s_fileCount is ready.
+            enterOfflineMode();
+            // Next iteration hits the g_offlineMode branch above and starts playback.
+            continue;
         }
 
-        if (readyMask == 0x0F) {
-            DisplayMsg dmsg = { msg.frameId, writeSet };
-            if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
-                g_abortedFrames++;
+        // ── WiFi disconnection watchdog ───────────────────────────────────────
+        // If WiFi is disconnected for more than 10 seconds, enter offline mode.
+        if (!g_wifiOk
+            && g_wifiDisconnectedMs > 0
+            && (millis() - g_wifiDisconnectedMs) > 10000) {
 
-            uint8_t justCompleted = writeSet;
-            writeSet = (writeSet + 1) % g_numDisplayBufs;
+            Serial.println("[MAIN] WiFi disconnected for 10 s — entering offline mode");
+            enterOfflineMode();
+            continue;
+        }
 
-            // Seed the next write buffer with the frame we just finished,
-            // before any tile of the upcoming frame gets decoded into it.
-            // Without this, a tile that fails mid-decode (corrupt/truncated
-            // bitstream) or never arrives in time (network/decode
-            // backpressure) leaves whatever partial MCU rows/garbage was
-            // last written there — visible as torn/"shredded" blocks.
-            // With the seed, a stalled tile falls back to the last good
-            // frame's pixels instead: stale at worst, never garbage.
-            // Safe to overwrite here — same assumption the original 2-buffer
-            // design already relied on (decode is Core-1 exclusive between
-            // writeSet flips, and by the time writeSet cycles back to this
-            // index displayTask's DMA out of it has long since finished).
-            memcpy(frameFb[writeSet], frameFb[justCompleted],
-                   (size_t)SCREEN_W * SCREEN_H * 2);
+        // ── Normal streaming decode path ────────────────────────────────────────
+        DecodeMsg msg;
+        if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) continue;
 
-            readyMask    = 0;
+        if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
             pendingFrame = 0xFF;
+            readyMask    = 0;
             frameStartMs = 0;
         }
-    }
 
-    uint32_t now = millis();
-    if (stat_prevMs > 0) {
-        static uint32_t lastIv = 0;
-        uint32_t iv = now - stat_prevMs;
-        if (lastIv > 0) {
-            int32_t d = (int32_t)iv - (int32_t)lastIv;
-            stat_jitter += (fabsf((float)d) - stat_jitter) / 16.0f;
+        if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
+            if (pendingFrame != 0xFF && readyMask != 0)
+                g_abortedFrames++;
+            pendingFrame = msg.frameId;
+            readyMask    = 0;
+            frameStartMs = millis();
         }
-        lastIv = iv;
+
+        uint32_t decUs = 0;
+        bool ok = decodeSlot(msg, decUs);
+
+        xSemaphoreGive(slotFree[msg.slotIdx]);
+
+        if (ok) {
+            tiles[msg.tId].stat_decoded++;
+            decodeAcc   += decUs;
+            decodeCount++;
+
+            readyMask |= (uint8_t)(1u << msg.tId);
+
+            if (decodeCount >= 16) {
+                g_avgDecodeUs = decodeAcc / decodeCount;
+                decodeAcc = 0; decodeCount = 0;
+            }
+
+            if (!streamStarted) {
+                streamStarted = true;
+                g_streaming   = true;
+                g_lastPktMs   = millis();
+                statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
+                delay(200);
+            }
+
+            if (readyMask == 0x0F) {
+                DisplayMsg dmsg = { msg.frameId, writeSet };
+                if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
+                    g_abortedFrames++;
+
+                uint8_t justCompleted = writeSet;
+                writeSet = (writeSet + 1) % g_numDisplayBufs;
+
+                // Seed the next write buffer with the frame we just finished,
+                // before any tile of the upcoming frame gets decoded into it.
+                // Without this, a tile that fails mid-decode (corrupt/truncated
+                // bitstream) or never arrives in time (network/decode
+                // backpressure) leaves whatever partial MCU rows/garbage was
+                // last written there — visible as torn/"shredded" blocks.
+                // With the seed, a stalled tile falls back to the last good
+                // frame's pixels instead: stale at worst, never garbage.
+                // Safe to overwrite here — same assumption the original
+                // 2-buffer design already relied on (decode is Core-1
+                // exclusive between writeSet flips, and by the time writeSet
+                // cycles back to this index displayTask's DMA out of it has
+                // long since finished).
+                memcpy(frameFb[writeSet], frameFb[justCompleted],
+                       (size_t)SCREEN_W * SCREEN_H * 2);
+
+                readyMask    = 0;
+                pendingFrame = 0xFF;
+                frameStartMs = 0;
+            }
+        }
+
+        uint32_t now = millis();
+        if (stat_prevMs > 0) {
+            uint32_t iv = now - stat_prevMs;
+            if (lastIv > 0) {
+                int32_t d = (int32_t)iv - (int32_t)lastIv;
+                stat_jitter += (fabsf((float)d) - stat_jitter) / 16.0f;
+            }
+            lastIv = iv;
+        }
+        stat_prevMs = now;
     }
-    stat_prevMs = now;
 }
+
+// Arduino framework still requires loop() to exist and link, but nothing
+// calls it anymore — setup() creates every task explicitly (including
+// decodeTask, which replaces what loop() used to do) and then deletes its
+// own task at the end instead of falling through to loop().
+void loop() {}
