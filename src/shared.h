@@ -38,21 +38,6 @@
 
 static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
 static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  MEMORY MANAGEMENT ZONE
-//  Edit CFG_ values to tune pipeline depth / display smoothness.
-//  Allocator in setup() will fall back gracefully if memory is insufficient.
-//
-//  SRAM budget (N16R8): ~300 KB free after boot.
-//    Each JPEG slot costs MAX_TILE_JPEG = 33.6 KB  → 6 slots = ~202 KB
-//  PSRAM budget (N16R8): 8 MB OPI, heap-mapped to ~7.9 MB.
-//    Each display buffer costs 320×240×2 = 150 KB  → 6 buffers = ~900 KB
-//
-//  CFG_NUM_JPEG_SLOTS   (1–6)  — SRAM assembly buffers for tile decode.
-//    More slots → networkTask can queue more tiles without stalling the sender,
-//    reducing ABRT at high JPEG quality.  4 is optimal for a 4-tile / 35 fps stream.
-//
 //  CFG_NUM_DISPLAY_BUFS (2–6)  — PSRAM ping-pong buffers for the display DMA.
 //    Minimum 2 required for tear-free output.  3+ reduces frame drops when
 //    decoding is slower than the display push (e.g. complex scenes at high quality).
