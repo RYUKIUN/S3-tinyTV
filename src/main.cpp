@@ -25,31 +25,21 @@
  *  If WiFi never associates within WIFI_CONNECT_TIMEOUT_MS, the ESP just
  *  restarts and tries again (no offline/local-playback fallback anymore).
  */
-#include <LovyanGFX.hpp>
-#include <JPEGDEC.h>
-#include <Arduino.h>
-#include <WiFi.h>
-#include <ArduinoOTA.h>
-#include <esp_wifi.h>
-#include <esp_attr.h>
-#include <esp_heap_caps.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
-#include <fcntl.h>
-#include <math.h>
+// nexus.h already pulls in Arduino.h, WiFi.h, esp_wifi.h, JPEGDEC.h,
+// LovyanGFX.hpp, FreeRTOS/queue/semphr, lwip sockets/netdb, fcntl, math —
+// only listing what's uniquely needed here.
 #include "nexus.h"
 #include "display.h"
 #include "network.h"
 #include "jpeg_decode.h"
+#include <ArduinoOTA.h>
+#include <esp_attr.h>
+#include <esp_heap_caps.h>
+#include "freertos/task.h"
 #include "esp_freertos_hooks.h"
 #include <cstring>
 
-
-// WIFI_SSID / WIFI_PASS / OTA_HOSTNAME are now #defines in nexus.h (Zone 1)
+// WIFI_SSID / WIFI_PASS / OTA_HOSTNAME are #defines in nexus.h (Zone 1)
 // — edit them there, not here.
 
 // ─────────────────────────────────────────────
@@ -133,7 +123,6 @@ volatile bool     g_streaming        = false;
 volatile bool     g_wifiOk           = false;
 volatile uint32_t g_lastPktMs        = 0;
 volatile uint32_t g_wifiConnectedMs  = 0;   // millis() when WiFi first associated
-volatile uint32_t g_wifiDisconnectedMs = 0; // millis() when WiFi last disconnected
 
 // Forward decl — defined after setup() (was the body of Arduino loop());
 // setup() needs it to spin the task up.
@@ -167,7 +156,7 @@ static void otaTask(void* /*pv*/) {
     });
 
     ArduinoOTA.begin();
-    Serial.printf("[OTA] Ready — hostname: esp32s3-display  IP: %s\n",
+    Serial.printf("[OTA] Ready — hostname: " OTA_HOSTNAME "  IP: %s\n",
                   WiFi.localIP().toString().c_str());
 
     for (;;) {
@@ -293,14 +282,15 @@ void setup() {
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    esp_wifi_set_max_tx_power(80);   // ~10 dBm — the community fix
+    esp_wifi_set_max_tx_power(80);   // units are 0.25 dBm steps → requests 20 dBm;
+                                      // actual radiated power may be clamped lower
+                                      // by regional regulatory limits
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
 
     uint32_t ws = millis();
     uint8_t  tick = 0;
-    bool wifiConnected = false;
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(250);
@@ -317,7 +307,6 @@ void setup() {
         }
     }
 
-    wifiConnected = true;
     esp_wifi_set_ps(WIFI_PS_NONE);
     g_wifiOk = true;
     g_wifiConnectedMs = millis();
@@ -332,7 +321,7 @@ void setup() {
 
     // ── OTA ───────────────────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(otaTask, "OTA", 8192, NULL, 1, NULL, 0);
-    statusLine(4, "OTA:", "Ready (esp32s3-display)", TFT_CYAN);
+    statusLine(4, "OTA:", "Ready (" OTA_HOSTNAME ")", TFT_CYAN);
 
     // ── Streaming tasks ───────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(networkTask,     "NetTask",     10240, NULL, 3, NULL, 0);

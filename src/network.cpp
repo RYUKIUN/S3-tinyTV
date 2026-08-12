@@ -2,9 +2,6 @@
 #include "display.h"
 #include <WiFi.h>
 
-// Extern declarations for global variables
-extern volatile uint32_t g_wifiDisconnectedMs;
-
 static IRAM_ATTR void resetTile(uint8_t t) {
     memset(tiles[t].chunkGot, 0, sizeof(tiles[t].chunkGot));
     tiles[t].frameId      = 0xFF;
@@ -221,9 +218,7 @@ void wifiWatchdogTask(void*) {
         bool connected = (WiFi.status() == WL_CONNECTED);
         g_wifiOk = connected;
 
-        if (connected) {            if (g_wifiDisconnectedMs == 0) {
-                g_wifiDisconnectedMs = millis();
-            }            g_wifiDisconnectedMs = 0;  // reset disconnect timer
+        if (connected) {
             if (!g_streaming) {
                 int32_t rssi = WiFi.RSSI();
                 String  ip   = WiFi.localIP().toString();
