@@ -19,7 +19,7 @@ ESP_W, ESP_H = 320, 240
 
 # Target per-frame byte budget the Auto-mode quality controller aims to
 # stay under (4:2:0 chroma only — that's the only mode this sends now).
-MAGIC_BYTES = 16500
+MAGIC_BYTES = 16000
 
 # EMA Settings (Low-pass filter for bitrate)
 EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแต่ตอบสนองช้าลง (แนะนำ 0.1 - 0.2)

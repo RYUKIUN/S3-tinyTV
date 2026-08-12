@@ -40,28 +40,24 @@ It started as a simple "mirror my screen to a small display" idea and turned int
 
 ```mermaid
 flowchart LR
-    subgraph PC["PC Sender (captureJpeg.py)"]
-        A[Screen / video capture] --> B[Split into 4 tiles]
-        B --> C[JPEG encode<br/>adaptive quality]
-        C --> D[UDP chunk + send]
+    subgraph PC[PC Sender]
+        A[Capture frame] --> B[Split into 4 tiles]
+        B --> C[JPEG encode - adaptive quality]
+        C --> D[Send over UDP]
     end
 
-    D -- WiFi / UDP --> E
+    D --> E
 
-    subgraph ESP["ESP32-S3"]
-        subgraph Core0["Core 0"]
-            E[networkTask<br/>chunk reassembly] --> F[decodeQueue]
-            J[displayTask<br/>DMA push] --> K[(ILI9341 320x240)]
-            OTA[otaTask]
-            WD[wifiWatchdogTask]
-        end
-        subgraph Core1["Core 1"]
-            F --> G[decodeTask<br/>JPEGDEC per tile]
-            G --> H[(PSRAM framebuffer<br/>ping-pong)]
-        end
-        H --> J
+    subgraph ESP[ESP32-S3]
+        E[networkTask - Core 0] --> F[decodeQueue]
+        F --> G[decodeTask - Core 1]
+        G --> H[PSRAM framebuffer]
+        H --> J[displayTask - Core 0]
+        J --> K[ILI9341 320x240]
     end
 ```
+
+(`otaTask` and `wifiWatchdogTask` also run on Core 0 alongside `networkTask` and `displayTask` — left out of the diagram to keep it readable; see [`HARDWARE.md`](HARDWARE.md) for the full task/core breakdown.)
 
 Each of the 4 tiles is chunked over UDP, reassembled on the ESP, and handed to a dedicated decode task on Core 1 that writes decoded pixels directly into a PSRAM framebuffer. Once all 4 tiles for a frame land, Core 0's display task fires a single DMA transfer to the panel — the CPU touches zero pixels during the actual push. See [`HARDWARE.md`](HARDWARE.md) for the full pin-level wiring and memory budget.
 
