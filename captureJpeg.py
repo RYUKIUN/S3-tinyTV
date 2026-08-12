@@ -15,27 +15,34 @@ from queue import Queue
 #  GLOBAL SETTINGS
 # ─────────────────────────────────────────────
 PORT         = 12345
-ESP_W, ESP_H = 320, 240          
+ESP_W, ESP_H = 320, 240
 
-# Magic thresholds for auto-quality
-MAGIC_420 = 17500
-MAGIC_444 = 17000
+# Target per-frame byte budget the Auto-mode quality controller aims to
+# stay under (4:2:0 chroma only — that's the only mode this sends now).
+MAGIC_BYTES = 16500
 
 # EMA Settings (Low-pass filter for bitrate)
 EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแต่ตอบสนองช้าลง (แนะนำ 0.1 - 0.2)
 
-CHUNK_DATA_SIZE  = 1400          
+CHUNK_DATA_SIZE  = 1400
 NUM_TILES        = 4
 TILE_W, TILE_H   = 160, 120
 TILE_X = [  0, 160,   0, 160]
 TILE_Y = [  0,   0, 120, 120]
-MAX_TILE_JPEG  = 33600            
+MAX_TILE_JPEG  = 33600
 
 WINDOW_NAME_BASE     = "ESP32-S3 Stream [320x240]"
-UI_W, UI_H           = 480, 680  
+UI_W, UI_H           = 480, 600
 PREVIEW_W, PREVIEW_H = 480, 360
-DEFAULT_FPS          = 35
-DEFAULT_QUAL         = 70
+
+# Send rate is fixed — not user-adjustable — so the pipeline behaves the
+# same way every time instead of being a variable someone has to tune.
+BASE_FPS = 35
+
+# Auto mode: the quality controller is free to climb as high as this.
+AUTO_MAX_QUALITY = 80
+# Manual mode: starting point for the quality slider.
+MANUAL_QUALITY_DEFAULT = 70
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
@@ -55,7 +62,7 @@ UNIX_NICE_LEVEL      = -10
 
 # Settings dir: one JSON file per ESP IP so multiple instances don't collide
 SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings")
-SETTINGS_KEYS = ("Max FPS", "Base Qual", "Bilateral Mix", "Sharpen x0.1", "Chroma sub", "Debug Info")
+SETTINGS_KEYS = ("Mode (0=Auto 1=Manual)", "Manual Quality", "Sharpen", "Show Stats")
 
 # Rediscovery: how often the main process re-checks for new ESPs after the
 # first one has already been picked up (seconds).
@@ -118,10 +125,10 @@ def select_monitor(claimed_indices=()):
 # ─────────────────────────────────────────────
 #  NETWORKING & DYNAMIC PACING
 # ─────────────────────────────────────────────
-_JPEG_SUB_MODES = {
-    0: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420, "4:2:0", MAGIC_420),
-    1: (cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444, "4:4:4", MAGIC_444),
-}
+# Chroma is always 4:2:0 — it's the cheapest mode for the ESP to decode and
+# there's no user-facing reason to ever send anything else.
+JPEG_SUB_FLAG = cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420
+JPEG_SUB_STR  = "4:2:0"
 
 def _send_udp(sock: socket.socket, data, dest):
     while True:
@@ -338,11 +345,20 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     all_monitors = list_monitor_candidates()   # [(idx, dict), ...] fixed for the session
     max_monitor_idx = max((i for i, _ in all_monitors), default=1)
 
+    # Five controls, each self-explanatory from its own label (OpenCV's
+    # trackbar UI has no separate space for tooltips, so the name itself
+    # has to carry the explanation):
+    #   Mode           — 0 = Auto (quality manages itself), 1 = Manual (you set it)
+    #   Manual Quality — only takes effect when Mode = Manual
+    #   Sharpen        — 0 = off, higher = crisper edges
+    #   Show Stats     — 0 = clean preview, 1 = performance overlay on top
+    #   Monitor        — which screen to capture
     _tb_cfg = {
-        "Max FPS": (DEFAULT_FPS, 60), "Base Qual": (DEFAULT_QUAL, 95),
-        "Bilateral Mix": (0, 100), "Sharpen x0.1": (10, 20),
-        "Chroma sub": (0, 1), "Debug Info": (1, 1),
-        "Display Idx": (monitor_idx, max_monitor_idx),
+        "Mode (0=Auto 1=Manual)": (0, 1),
+        "Manual Quality":         (MANUAL_QUALITY_DEFAULT, 95),
+        "Sharpen":                (10, 20),
+        "Show Stats":             (1, 1),
+        "Monitor":                (monitor_idx, max_monitor_idx),
     }
 
     saved_data = {}
@@ -355,7 +371,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, UI_W, UI_H)
     for k, (v, m) in _tb_cfg.items():
-        if k == "Display Idx":
+        if k == "Monitor":
             # Always start on the auto-selected monitor for this run;
             # we don't persist this choice across restarts.
             cv2.createTrackbar(k, window_name, monitor_idx, m, lambda x: None)
@@ -367,7 +383,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
 
     m_left, m_top, m_w, m_h = monitor_info.get("left", 0), monitor_info.get("top", 0), monitor_info.get("width", ESP_W), monitor_info.get("height", ESP_H)
     latest_esp_stats, last_debug_send, last_frame_bytes = {}, 0, 0
-    current_qual = saved_data.get("Base Qual", DEFAULT_QUAL)
+    current_qual = saved_data.get("Manual Quality", MANUAL_QUALITY_DEFAULT)
     current_monitor_idx = monitor_idx
 
     # EMA Accumulator
@@ -378,13 +394,11 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1: break
             t_start = time.perf_counter()
 
-            fps = cv2.getTrackbarPos("Max FPS", window_name)
-            user_max_qual = cv2.getTrackbarPos("Base Qual", window_name)
-            bilateral_mix = cv2.getTrackbarPos("Bilateral Mix", window_name)
-            sharpen_steps = cv2.getTrackbarPos("Sharpen x0.1", window_name)
-            sub_idx = cv2.getTrackbarPos("Chroma sub", window_name)
-            debug_state = cv2.getTrackbarPos("Debug Info", window_name)
-            selected_display = cv2.getTrackbarPos("Display Idx", window_name)
+            mode           = cv2.getTrackbarPos("Mode (0=Auto 1=Manual)", window_name)
+            manual_quality = cv2.getTrackbarPos("Manual Quality", window_name)
+            sharpen_steps  = cv2.getTrackbarPos("Sharpen", window_name)
+            debug_state    = cv2.getTrackbarPos("Show Stats", window_name)
+            selected_display = cv2.getTrackbarPos("Monitor", window_name)
 
             # ── Manual display override ──
             if selected_display != current_monitor_idx:
@@ -401,10 +415,17 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                     m_left, m_top, m_w, m_h = monitor_info["left"], monitor_info["top"], monitor_info["width"], monitor_info["height"]
                 else:
                     # invalid index chosen, snap trackbar back
-                    cv2.setTrackbarPos("Display Idx", window_name, current_monitor_idx)
+                    cv2.setTrackbarPos("Monitor", window_name, current_monitor_idx)
 
-            sub_flag, sub_str, magic_threshold = _JPEG_SUB_MODES.get(sub_idx, _JPEG_SUB_MODES[0])
-            if current_qual > user_max_qual: current_qual = user_max_qual
+            sub_flag, sub_str, magic_threshold = JPEG_SUB_FLAG, JPEG_SUB_STR, MAGIC_BYTES
+
+            if mode == 1:
+                # Manual — quality is exactly what the slider says, every frame.
+                current_qual = manual_quality
+            elif current_qual > AUTO_MAX_QUALITY:
+                # Auto — enforce the ceiling (matters right after switching
+                # from Manual, where current_qual may be above it).
+                current_qual = AUTO_MAX_QUALITY
 
             try:
                 while True:
@@ -433,35 +454,37 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
             resized = cv2.resize(frame, (ESP_W, ESP_H), interpolation=cv2.INTER_AREA)
-            if bilateral_mix > 0:
-                resized = cv2.bilateralFilter(resized, 5, bilateral_mix, bilateral_mix)
             if sharpen_steps > 0:
                 s = sharpen_steps * 0.1
                 resized = cv2.addWeighted(resized, 1.0 + s, cv2.GaussianBlur(resized, (0,0), 0.3 + s*0.35), -s, 0)
 
-            last_frame_bytes = send_tiles(sock, target_ip, resized, current_qual, sub_flag, t_start, fps,
+            last_frame_bytes = send_tiles(sock, target_ip, resized, current_qual, sub_flag, t_start, BASE_FPS,
                                            send_buf, send_view, frame_id_box)
 
             # ─────────────────────────────────────────────
-            #  AUTO QUALITY LOGIC (EMA SMOOTHED)
+            #  AUTO QUALITY LOGIC (EMA SMOOTHED) — Auto mode only.
+            #  In Manual mode the slider already set current_qual above;
+            #  we still keep the EMA fresh so switching back to Auto doesn't
+            #  start from stale data.
             # ─────────────────────────────────────────────
             if ema_avg_bytes is None:
                 ema_avg_bytes = last_frame_bytes
             else:
                 ema_avg_bytes = (EMA_ALPHA * last_frame_bytes) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
 
-            lower_bound = magic_threshold * 0.90
+            if mode == 0:
+                lower_bound = magic_threshold * 0.90
 
-            if last_frame_bytes > magic_threshold:
-                # Hard/instant drop: THIS frame actually blew the threshold —
-                # react now on the raw size, don't wait for the EMA to catch
-                # up (by the time it does, the ESP has already stalled on it
-                # and the backlog bleeds into the following frames too).
-                current_qual = max(5, current_qual - 6)
-            elif ema_avg_bytes < lower_bound:
-                # Gentle climb back up once comfortably under threshold,
-                # smoothed via EMA so quality doesn't flicker up and down.
-                current_qual = min(user_max_qual, current_qual + 1)
+                if last_frame_bytes > magic_threshold:
+                    # Hard/instant drop: THIS frame actually blew the threshold —
+                    # react now on the raw size, don't wait for the EMA to catch
+                    # up (by the time it does, the ESP has already stalled on it
+                    # and the backlog bleeds into the following frames too).
+                    current_qual = max(5, current_qual - 6)
+                elif ema_avg_bytes < lower_bound:
+                    # Gentle climb back up once comfortably under threshold,
+                    # smoothed via EMA so quality doesn't flicker up and down.
+                    current_qual = min(AUTO_MAX_QUALITY, current_qual + 1)
             # ─────────────────────────────────────────────
 
             # UI rendering
@@ -487,7 +510,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 cv2.line(overlay, (10, header_h), (PREVIEW_W - 10, header_h), UI_CARD_EDGE, 1, cv2.LINE_AA)
 
                 # ── Metric grid ──
-                cols, rows = 4, 3
+                cols, rows = 4, 4
                 margin, gap = 10, 6
                 grid_top = header_h + 8
                 grid_bottom = PREVIEW_H - 16
@@ -515,8 +538,10 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                      _pct_ratio(str(last_frame_bytes), 0, magic_threshold)),
                     ("AVG",   f"{int(ema_avg_bytes)}B",                          UI_ACCENT,
                      _pct_ratio(str(int(ema_avg_bytes)), 0, magic_threshold)),
-                    ("QUALITY", f"{current_qual}/{user_max_qual}",               (255, 255, 255),
-                     _pct_ratio(str(current_qual), 0, max(1, user_max_qual))),
+                    ("QUALITY", f"{current_qual}",                               (255, 255, 255),
+                     _pct_ratio(str(current_qual), 0, 95)),
+                    ("MODE",    "MANUAL" if mode == 1 else "AUTO",
+                     UI_ACCENT if mode == 1 else UI_OK, None),
                 ]
 
                 for i, (label, value, col, ratio) in enumerate(metrics):
@@ -525,8 +550,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                     cy = grid_top + r * (cell_h + gap)
                     _draw_chip(overlay, cx, cy, cell_w, cell_h, label, value, col, ratio)
 
-                # ── Footer: chroma sub-sampling mode ──
-                footer_txt = f"CHROMA {sub_str}"
+                # ── Footer: quick hint ──
+                footer_txt = f"{sub_str} chroma  ·  press Q to quit"
                 cv2.putText(overlay, footer_txt, (10, PREVIEW_H - 4), UI_FONT, 0.34, UI_LABEL_COL, 1, cv2.LINE_AA)
 
                 # Single blend: this is the only place DEBUG_OVERLAY_ALPHA is used,
@@ -535,7 +560,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
 
             cv2.imshow(window_name, preview)
             elapsed = time.perf_counter() - t_start
-            wait_ms = max(1, int(((1.0 / max(1, fps)) - elapsed) * 1000))
+            wait_ms = max(1, int(((1.0 / BASE_FPS) - elapsed) * 1000))
             if cv2.waitKey(wait_ms) & 0xFF == ord('q'): break
 
     except KeyboardInterrupt: pass

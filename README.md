@@ -28,10 +28,10 @@ It started as a simple "mirror my screen to a small display" idea and turned int
 ## Highlights
 
 - **Real-time wireless video** — 320×240 @ up to 35 FPS, decoded and displayed live, entirely over WiFi.
+- **Adaptive bitrate — the single biggest quality-of-life feature here.** The PC-side sender watches its own output size every single frame and throttles JPEG quality up or down in real time to stay under a target byte budget. Scene gets more complex, network gets congested, ESP falls behind — quality eases down automatically before it ever turns into stutter or a backlog, then climbs back up the moment there's headroom again. Runs in **Auto** mode by default with zero input from you; flip to **Manual** in the control UI any time you want to lock quality yourself and drive it directly.
 - **Tile-parallel decode pipeline** — each frame is split into 4 independently-streamed JPEG tiles, reassembled and decoded through a 4-slot SRAM pipeline so the decoder never idles waiting on the network.
 - **Dual-core FreeRTOS architecture** — Core 0 owns networking, display DMA, and OTA; Core 1 is dedicated entirely to decode. Fully task-based, no reliance on the Arduino framework's implicit loop.
 - **Self-healing frame recovery** — if a tile fails to decode or arrive in time (network hiccup, decoder falling behind under load), the pipeline falls back to the last known-good pixels for just that tile instead of showing corrupted or torn video.
-- **Adaptive quality control** — the PC-side sender watches its own output size in real time and throttles JPEG quality up or down to stay within a target bitrate, so quality degrades gracefully under load instead of stuttering.
 - **Zero-copy decode path** — JPEG MCUs are decoded directly into the display framebuffer in the panel's native pixel format; no intermediate scratch buffer, no byte-swap pass.
 - **OTA wireless updates** — reflash the firmware over WiFi after the first USB flash; no physical access needed.
 - **Live diagnostics** — the ESP streams back FPS, decode time, per-core CPU load, temperature, memory headroom, and drop/abort counters, rendered as an on-screen debug overlay on the PC sender.
@@ -95,6 +95,18 @@ The PC-side sender lives in `captureJpeg.py` (requires `opencv-python`, `mss`, `
 pip install opencv-python mss numpy psutil
 python captureJpeg.py
 ```
+
+A control window opens per discovered ESP with five self-explanatory sliders:
+
+| Control | What it does |
+|---|---|
+| `Mode (0=Auto 1=Manual)` | Auto = adaptive bitrate manages quality for you (default). Manual = you set it directly. |
+| `Manual Quality` | JPEG quality, only used in Manual mode. |
+| `Sharpen` | Optional edge sharpening, 0 = off. |
+| `Show Stats` | Toggles the live performance overlay (FPS, decode time, CPU load, temps, memory, drops) on top of the preview. |
+| `Monitor` | Which screen to capture, if you have more than one. |
+
+Frame rate and chroma subsampling aren't exposed as controls on purpose — they're fixed (35 FPS send rate, 4:2:0 chroma) because there was no real reason to make them user-tunable, and fewer knobs means less to get wrong.
 
 ## Project structure
 
