@@ -1,8 +1,11 @@
 #pragma once
 
-#include "shared.h"
+#include "nexus.h"
 #include <LovyanGFX.hpp>
 
+// All pin numbers and SPI config below come from nexus.h (Zone 1) — there's
+// nothing hardcoded here. If your panel is wired differently, edit the
+// LCD_PIN_* / LCD_* defines in nexus.h, not this file.
 class LGFX : public lgfx::LGFX_Device {
     lgfx::Bus_SPI        _bus;
     lgfx::Panel_ILI9341  _panel;
@@ -11,17 +14,13 @@ public:
         {
             auto cfg = _bus.config();
 
-            // ── SPI host ──────────────────────────────────────────────────────
-            // USE_HSPI_PORT=1 in the original build flags means SPI2 host.
-            // LovyanGFX uses spi_host_device_t: SPI2_HOST = 1, SPI3_HOST = 2.
-            cfg.spi_host   = SPI2_HOST;   // SPI2 (HSPI)
-            cfg.freq_write = 80000000;    
+            cfg.spi_host   = LCD_SPI_HOST;
+            cfg.freq_write = LCD_WRITE_HZ;
 
-            // ── Pins (from build_flags) ───────────────────────────────────────
-            cfg.pin_sclk = 12;   // TFT_SCLK
-            cfg.pin_mosi = 13;   // TFT_MOSI
-            cfg.pin_miso = -1;   // not connected
-            cfg.pin_dc   =  4;   // TFT_DC  (Data/Command)
+            cfg.pin_sclk = LCD_PIN_SCLK;
+            cfg.pin_mosi = LCD_PIN_MOSI;
+            cfg.pin_miso = LCD_PIN_MISO;
+            cfg.pin_dc   = LCD_PIN_DC;
 
             cfg.spi_3wire  = false;  // 4-wire SPI (MOSI + DC line)
             cfg.use_lock   = true;   // safe for multi-device SPI bus
@@ -32,12 +31,12 @@ public:
         {
             auto cfg = _panel.config();
 
-            cfg.pin_cs   = 10;   // TFT_CS
-            cfg.pin_rst  =  5;   // TFT_RST
-            cfg.pin_busy = -1;
+            cfg.pin_cs   = LCD_PIN_CS;
+            cfg.pin_rst  = LCD_PIN_RST;
+            cfg.pin_busy = LCD_PIN_BUSY;
 
-            cfg.panel_width  = 240;
-            cfg.panel_height = 320;
+            cfg.panel_width  = LCD_PANEL_W;
+            cfg.panel_height = LCD_PANEL_H;
             cfg.offset_x         = 0;
             cfg.offset_y         = 0;
             cfg.offset_rotation  = 0;

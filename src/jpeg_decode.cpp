@@ -1,4 +1,4 @@
-#include "shared.h"
+#include "nexus.h"
 #include "jpeg_decode.h"
 
 static JPEGDEC jpeg_dec;

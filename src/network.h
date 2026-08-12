@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shared.h"
+#include "nexus.h"
 
 void networkTask(void*);
 void wifiWatchdogTask(void*);

@@ -21,21 +21,21 @@ diverge, trust the code.
 
 ## Display — ILI9341, 320×240, SPI
 
-Driven via LovyanGFX (`LGFX` class in `src/display.h`), **not** Adafruit_GFX.
+Driven via LovyanGFX (`LGFX` class in `src/display.h`), **not** Adafruit_GFX. All pin numbers and SPI config are `#define`s in [`src/nexus.h`](src/nexus.h) (Zone 1) — `display.h` only references them, nothing is hardcoded there anymore.
 
-| Signal | GPIO | Notes |
+| Signal | GPIO | `nexus.h` macro |
 |---|---|---|
-| SCLK | 12 | shared SPI clock |
-| MOSI | 13 | shared SPI data out |
-| MISO | -1 (not connected) | display is write-only; nothing reads back from the panel |
-| CS | 10 | ILI9341 chip select |
-| DC | 4 | data/command |
-| RST | 5 | reset |
-| BUSY | -1 (not connected) | not applicable to this panel |
+| SCLK | 12 | `LCD_PIN_SCLK` |
+| MOSI | 13 | `LCD_PIN_MOSI` |
+| MISO | -1 (not connected) | `LCD_PIN_MISO` — display is write-only; nothing reads back from the panel |
+| CS | 10 | `LCD_PIN_CS` |
+| DC | 4 | `LCD_PIN_DC` |
+| RST | 5 | `LCD_PIN_RST` |
+| BUSY | -1 (not connected) | `LCD_PIN_BUSY` — not applicable to this panel |
 
-- SPI host: `SPI2_HOST` (HSPI)
-- Write clock: 75 MHz (`cfg.freq_write`)
-- Panel native size: 240×320 (`panel_width`/`panel_height`); software rotation 3 → logical 320×240 landscape
+- SPI host: `SPI2_HOST` (HSPI) — `LCD_SPI_HOST`
+- Write clock: 80 MHz — `LCD_WRITE_HZ`
+- Panel native size: 240×320 (`LCD_PANEL_W`/`LCD_PANEL_H`); software rotation 3 → logical 320×240 landscape
 - `dummy_read_pixel = 8`, `readable = false`, `bus_shared = true` (bus left shareable — was set up anticipating a touch controller on the same bus; see below)
 - Color depth: 16-bit (RGB565), `RGB565_BIG_ENDIAN` used throughout the decode pipeline to match the panel's native SPI byte order
 

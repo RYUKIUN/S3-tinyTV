@@ -41,7 +41,7 @@
 #include <lwip/netdb.h>
 #include <fcntl.h>
 #include <math.h>
-#include "shared.h"
+#include "nexus.h"
 #include "display.h"
 #include "network.h"
 #include "jpeg_decode.h"
@@ -49,11 +49,8 @@
 #include <cstring>
 
 
-// ─────────────────────────────────────────────
-//  CONFIG DEFINITIONS
-// ─────────────────────────────────────────────
-const char* WIFI_SSID  = "Endmin";
-const char* WIFI_PASS  = "987654321";
+// WIFI_SSID / WIFI_PASS / OTA_HOSTNAME are now #defines in nexus.h (Zone 1)
+// — edit them there, not here.
 
 // ─────────────────────────────────────────────
 //  PIPELINE SLOTS DEFINITIONS
@@ -147,7 +144,7 @@ static void decodeTask(void*);
 //  OTA TASK  (Core 0, priority 1)
 // ─────────────────────────────────────────────
 static void otaTask(void* /*pv*/) {
-    ArduinoOTA.setHostname("esp32s3-display");
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
 
     ArduinoOTA.onStart([]() {
         String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";

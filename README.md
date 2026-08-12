@@ -70,7 +70,7 @@ Each of the 4 tiles is chunked over UDP, reassembled on the ESP, and handed to a
 | | |
 |---|---|
 | MCU | ESP32-S3 (dual-core, 16 MB flash, 8 MB PSRAM) |
-| Display | ILI9341, 320×240, SPI (75 MHz write clock) |
+| Display | ILI9341, 320×240, SPI (80 MHz write clock) |
 | Link | WiFi 802.11n |
 
 Full pinout, SPI bus configuration, and memory budget: **[`HARDWARE.md`](HARDWARE.md)**.
@@ -78,6 +78,8 @@ Full pinout, SPI bus configuration, and memory budget: **[`HARDWARE.md`](HARDWAR
 ## Getting started
 
 Requires [PlatformIO](https://platformio.org/).
+
+**Before your first flash**, open [`src/nexus.h`](src/nexus.h) — it's the one file you need to edit. Zone 1 at the top has your WiFi credentials and display pin wiring; nothing else in the codebase needs to be touched to get this running on your own network and hardware.
 
 ```bash
 # First flash — wired, over USB
@@ -89,12 +91,14 @@ pio run -t upload
 pio run -t upload
 ```
 
-The PC-side sender lives in `captureJpeg.py` (requires `opencv-python`, `mss`, `numpy`, `psutil`). It auto-discovers any ESP32-S3 running this firmware on the local network and starts streaming automatically:
+The PC-side sender lives in `captureJpeg.py`:
 
 ```bash
-pip install opencv-python mss numpy psutil
+pip install -r requirements.txt
 python captureJpeg.py
 ```
+
+It auto-discovers any ESP32-S3 running this firmware on the local network and starts streaming automatically — no IP address to type in, no config to edit.
 
 A control window opens per discovered ESP with five self-explanatory sliders:
 
@@ -112,14 +116,17 @@ Frame rate and chroma subsampling aren't exposed as controls on purpose — they
 
 ```
 src/
-  main.cpp           entry point, task orchestration, decode task
+  nexus.h             ← start here — WiFi, pins, and every other setting, zoned by priority
+  main.cpp            entry point, task orchestration, decode task
   network.cpp/.h      UDP receive, tile chunk reassembly, WiFi watchdog
   jpeg_decode.cpp/.h  per-tile JPEG decode → PSRAM framebuffer
   display.cpp/.h      LovyanGFX panel driver, DMA display task
-  shared.h            pipeline structs, buffer sizes, cross-task globals
 captureJpeg.py         PC-side capture / encode / send + live control UI
+requirements.txt       Python dependencies (pip install -r requirements.txt)
 HARDWARE.md            pin wiring, SPI config, memory budget
 ```
+
+`src/nexus.h` is the single file everything else in the firmware connects through — every WiFi credential, pin number, buffer size, and timeout lives there, organized into zones by how likely you are to need to touch it: Zone 1 is "edit this before you flash," Zone 2 is "change this if your hardware setup differs," Zone 3 is timing tunables, and Zone 4 is internal plumbing (structs, FreeRTOS handles) that the rest of the firmware depends on but you shouldn't need to edit.
 
 ## Known limitations
 
