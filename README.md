@@ -66,7 +66,7 @@ Each of the 4 tiles is chunked over UDP, reassembled on the ESP, and handed to a
 | | |
 |---|---|
 | MCU | ESP32-S3 (dual-core, 16 MB flash, 8 MB PSRAM) |
-| Display | ILI9341, 320×240, SPI (80 MHz write clock) |
+| Display | ILI9341, 320×240, SPI (40 MHz write clock) |
 | Link | WiFi 802.11n |
 
 Full pinout, SPI bus configuration, and memory budget: **[`HARDWARE.md`](HARDWARE.md)**.

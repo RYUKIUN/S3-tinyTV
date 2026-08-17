@@ -47,7 +47,16 @@
 // If your panel is wired to different pins, this is the only place you
 // need to change it — display.h reads these, nothing is hardcoded there.
 #define LCD_SPI_HOST    SPI2_HOST   // ESP32-S3 has SPI2_HOST / SPI3_HOST available
-#define LCD_WRITE_HZ    80000000    // SPI write clock
+
+// SPI write clock. 80MHz is right at the edge of what jumper-wire/breadboard
+// wiring can carry reliably on this panel — random bit corruption at that
+// rate shows up as unpredictable tearing (top/bottom of frame visibly
+// split or shifted, position varies frame to frame). Dropped to a safer
+// default; raise it back up in ~10MHz steps and watch for glitches
+// returning if you want to reclaim some of that margin once wiring is
+// solid (short leads, common ground, ideally soldered rather than
+// breadboarded).
+#define LCD_WRITE_HZ    75000000
 
 #define LCD_PIN_SCLK    12
 #define LCD_PIN_MOSI    13

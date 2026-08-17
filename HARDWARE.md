@@ -34,7 +34,10 @@ Driven via LovyanGFX (`LGFX` class in `src/display.h`), **not** Adafruit_GFX. Al
 | BUSY | -1 (not connected) | `LCD_PIN_BUSY` — not applicable to this panel |
 
 - SPI host: `SPI2_HOST` (HSPI) — `LCD_SPI_HOST`
-- Write clock: 80 MHz — `LCD_WRITE_HZ`
+- Write clock: 40 MHz — `LCD_WRITE_HZ` (dropped from 80 MHz after intermittent
+  top/bottom frame tearing traced to signal integrity at that rate on
+  jumper-wire wiring; raise in ~10 MHz steps if your wiring can carry it —
+  see the comment in `nexus.h`)
 - Panel native size: 240×320 (`LCD_PANEL_W`/`LCD_PANEL_H`); software rotation 3 → logical 320×240 landscape
 - `dummy_read_pixel = 8`, `readable = false`, `bus_shared = true` (bus left shareable — was set up anticipating a touch controller on the same bus; see below)
 - Color depth: 16-bit (RGB565), `RGB565_BIG_ENDIAN` used throughout the decode pipeline to match the panel's native SPI byte order
