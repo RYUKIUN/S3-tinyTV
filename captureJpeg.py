@@ -46,6 +46,8 @@ MANUAL_QUALITY_DEFAULT = 70
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
+# Cursor ring colour while a hold-drag is active (BGR) — bright green.
+CURSOR_DRAG_COLOR = (80, 240, 120)
 DEBUG_OVERLAY_ALPHA   = 0.85
 DEBUG_SEND_INTERVAL_S = 0.5
 
@@ -105,20 +107,56 @@ def get_mouse_pos():
 # thresholds are the part you actually want to tune, and tuning them here costs
 # a script restart instead of an OTA reflash.
 #
-# Gesture vocabulary is deliberately just two things:
-#   tap   (press and release without moving)  -> left click at that point
-#   slide (press and move past the slop)      -> scroll wheel
-# There is no press-and-drag and no right click. A press that turns into a
-# slide can never also produce a click, so the two can't be confused.
+# Gesture vocabulary, three mutually-exclusive outcomes from one press:
+#   tap        (press, release quickly)          -> left click at that point
+#   slide      (press, move past the slop)       -> scroll wheel
+#   hold-drag  (press, stay still past HOLD_MS)  -> button held down; the
+#                                                   cursor then follows your
+#                                                   finger until you lift
+# There is no right click. A press commits to exactly one of the three, so
+# nothing can be both a click and a scroll, and arming a drag cancels the click.
 
 TOUCH_EV_DOWN, TOUCH_EV_MOVE, TOUCH_EV_UP = 0, 1, 2
 
 # How far (in ESP panel pixels, 320x240) a finger may wander and still count as
 # a tap. Above this the gesture commits to scrolling and can no longer click.
 TOUCH_TAP_SLOP_PX = 6
-# A press held longer than this is not a tap even if it never moved. Stops a
-# resting finger from firing a click when it finally lifts.
-TOUCH_TAP_MAX_MS = 400
+# Stay still this long and the press becomes a DRAG: the left button goes down
+# and stays down until you lift. This is the window-dragging gesture. Must be
+# comfortably below TOUCH_TAP_MAX_MS so a drag always arms before the tap window
+# closes — otherwise there'd be a dead band where a press does nothing at all.
+TOUCH_HOLD_MS = 400
+# Backstop only. Drags normally arm at TOUCH_HOLD_MS via tick(), so a press held
+# longer than that is already a drag and never reaches this check. It only
+# matters if ticking stalled (app busy), where it stops a very stale press from
+# firing a click on release.
+TOUCH_TAP_MAX_MS = 700
+# If a drag is active and nothing has been heard from the ESP for this long,
+# release the button. Without it, an ESP reboot or WiFi drop mid-drag would
+# leave the left button stuck down on the desktop with no way to recover.
+TOUCH_DRAG_TIMEOUT_S = 2.0
+
+# ── Cursor restore ────────────────────────────────────────────────────────────
+# Windows has exactly ONE system cursor; there is no such thing as a second,
+# independent pointer. So touching the panel necessarily yanks the cursor over
+# to the mirrored monitor, which is disruptive if you were using your real mouse
+# somewhere else. The fix is to put it back: remember where the physical mouse
+# was when the touch started, and return the cursor there once the gesture ends.
+# The cursor still visibly travels during the gesture — unavoidable, since the
+# click, the drag and the scroll all have to happen under it — but your mouse
+# never *stays* stolen.
+TOUCH_RESTORE_CURSOR = True
+# Wait this long after the gesture ends before restoring. Apps often read the
+# cursor position while handling the click or button-up they were just sent, so
+# snapping away in the same instant can make a click land at the restored
+# position instead. Deferred to a later frame rather than slept on, so the
+# capture loop never blocks.
+TOUCH_RESTORE_DELAY_MS = 40
+# If the cursor is further than this from where we last put it, the user has
+# grabbed their physical mouse mid-gesture. Restoring would then yank the cursor
+# away from where they just deliberately moved it, so we stand down instead —
+# the whole point is to stop fighting the mouse, not to fight it differently.
+TOUCH_RESTORE_TOLERANCE_PX = 8
 # Panel pixels of travel per wheel notch. Lower = faster scrolling.
 # The panel is only 240 px tall, so a full-height swipe is roughly
 # 240 / this many notches — 14 gives ~17 notches, about one long page.
@@ -201,9 +239,15 @@ def move_cursor_abs(x, y):
     ny = max(0, min(65535, ny))
     _send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny)
 
-def click_left():
+def mouse_down():
     _send_mouse(MOUSEEVENTF_LEFTDOWN)
+
+def mouse_up():
     _send_mouse(MOUSEEVENTF_LEFTUP)
+
+def click_left():
+    mouse_down()
+    mouse_up()
 
 def scroll_wheel(notches, horizontal=False):
     if not notches:
@@ -217,21 +261,96 @@ class TouchInjector:
 
     Holds one gesture's worth of state. Everything is driven by absolute panel
     coordinates, so a dropped MOVE packet is self-healing — the next one simply
-    resumes from wherever the finger actually is."""
+    resumes from wherever the finger actually is.
+
+    A gesture starts UNDECIDED and commits to exactly one outcome:
+
+        lift early              -> CLICK   (left click where you touched)
+        move past the slop      -> SCROLL  (wheel; axis locked at commit)
+        stay still past HOLD_MS -> DRAG    (button held down until you lift)
+
+    The three are mutually exclusive, so nothing can be both a click and a
+    scroll, and arming a drag cancels the click.
+    """
+
+    IDLE, UNDECIDED, SCROLL, DRAG = 0, 1, 2, 3
 
     def __init__(self):
+        self.mode      = self.IDLE
         self.touch_id  = None
         self.last_seq  = None
         self.start_xy  = (0, 0)
         self.start_ms  = 0.0
-        self.scrolling = False
-        self.axis      = None    # 'v' or 'h', locked when the slide commits
-        self.anchor    = (0, 0)  # last position a wheel notch was emitted from
+        self.last_ms   = 0.0     # arrival time of the most recent event
+        self.axis      = None    # 'v' or 'h', locked when a slide commits
+        self.anchor    = (0, 0)  # position the last wheel notch was measured from
+        self.restore_xy    = None   # where the physical mouse was before we barged in
+        self.last_injected = None   # last position WE moved the cursor to
+        self.restore_at    = 0.0    # ms timestamp the deferred restore is due
 
-    def reset(self):
-        self.touch_id  = None
-        self.scrolling = False
-        self.axis      = None
+    @property
+    def dragging(self):
+        return self.mode == self.DRAG
+
+    # ── Cursor borrow / return ────────────────────────────────────────────────
+    def _move(self, x, y):
+        """Move the cursor and remember we were the one who moved it."""
+        move_cursor_abs(x, y)
+        self.last_injected = (x, y)
+
+    def _borrow_cursor(self):
+        """Called as a gesture starts. Snapshots where the real mouse was."""
+        if not TOUCH_RESTORE_CURSOR:
+            return
+        if self.restore_at:
+            # A restore from the previous gesture is still pending, which means
+            # the cursor is still parked where WE left it, not where the user's
+            # mouse is. Cancel that restore and keep the older snapshot — it is
+            # the one that actually points at the physical mouse.
+            self.restore_at = 0.0
+            return
+        self.restore_xy = get_mouse_pos()
+
+    def _schedule_restore(self):
+        if TOUCH_RESTORE_CURSOR and self.restore_xy is not None:
+            self.restore_at = time.perf_counter() * 1000.0 + TOUCH_RESTORE_DELAY_MS
+
+    def _do_restore(self):
+        self.restore_at = 0.0
+        target = self.restore_xy
+        self.restore_xy = None
+        if target is None:
+            return
+        if self.last_injected is not None:
+            cur = get_mouse_pos()
+            if (abs(cur[0] - self.last_injected[0]) > TOUCH_RESTORE_TOLERANCE_PX or
+                    abs(cur[1] - self.last_injected[1]) > TOUCH_RESTORE_TOLERANCE_PX):
+                # The cursor is not where we parked it, so the user has taken
+                # hold of their physical mouse. Stand down.
+                self.last_injected = None
+                return
+        move_cursor_abs(*target)
+        self.last_injected = None
+
+    def reset(self, immediate=False):
+        """Abandon the current gesture. ALWAYS releases a held button.
+
+        This is the safety valve: if a drag is in progress and the stream dies,
+        touch gets switched off, or the window closes, a still-pressed left
+        button would leave the user's desktop stuck mid-drag with no way to
+        recover except clicking manually.
+
+        `immediate` returns the cursor right now instead of on a later frame —
+        for teardown paths where there will BE no later frame."""
+        if self.mode == self.DRAG:
+            mouse_up()
+        self.mode     = self.IDLE
+        self.touch_id = None
+        self.axis     = None
+        if immediate:
+            self._do_restore()
+        else:
+            self._schedule_restore()
 
     @staticmethod
     def panel_to_screen(px, py, mon_left, mon_top, mon_w, mon_h):
@@ -260,61 +379,107 @@ class TouchInjector:
         sy = max(0, min(mon_h - 1, int(round(sy))))
         return mon_left + sx, mon_top + sy
 
+    def tick(self, mon_left, mon_top, mon_w, mon_h):
+        """Called once per frame from the main loop, independent of packets.
+
+        Two things here cannot be driven by incoming events:
+
+        1. Arming a drag. A finger held perfectly still generates NO packets at
+           all — the ESP suppresses MOVEs below TOUCH_MOVE_EPS — so if we only
+           acted on arrival, holding still would never fire the hold timer.
+
+        2. The stuck-button watchdog. If the ESP reboots or WiFi drops mid-drag,
+           the UP that would release the button never arrives.
+        """
+        now = time.perf_counter() * 1000.0
+
+        # Deferred cursor return. Runs regardless of gesture state — this is the
+        # only thing that hands the mouse back, so it must not be gated on a
+        # gesture being in progress.
+        if self.restore_at and now >= self.restore_at:
+            self._do_restore()
+
+        if self.mode == self.UNDECIDED and (now - self.start_ms) >= TOUCH_HOLD_MS:
+            # Held still long enough: press and hold. The cursor is already
+            # parked at the touch point from the DOWN, so the button goes down
+            # exactly where the finger landed.
+            self.mode = self.DRAG
+            mouse_down()
+            return
+
+        if self.mode == self.DRAG and (now - self.last_ms) > TOUCH_DRAG_TIMEOUT_S * 1000.0:
+            # Nothing heard for too long — assume the link died rather than
+            # leave the button held down indefinitely.
+            self.reset()
+
     def handle(self, kind, tid, seq, px, py, mon_left, mon_top, mon_w, mon_h):
-        # New touch id means a new gesture, even if its DOWN packet was lost.
+        now = time.perf_counter() * 1000.0
+
+        # A new touch id means a new gesture, even if its DOWN packet was lost.
         if tid != self.touch_id:
             if kind == TOUCH_EV_UP:
                 return                      # tail of a gesture we never saw
-            self.touch_id  = tid
-            self.last_seq  = None
-            self.scrolling = False
-            self.axis      = None
+            self.reset()                    # releases a held button if any
+            self.touch_id = tid
+            self.last_seq = None
             kind = TOUCH_EV_DOWN            # treat as the start regardless
         elif self.last_seq is not None:
             # Drop UDP-reordered stragglers: anything not strictly newer than
-            # what we've already applied would rewind the gesture.
+            # what we have already applied would rewind the gesture.
             delta = (seq - self.last_seq) & 0xFF
             if delta == 0 or delta > 128:
                 return
         self.last_seq = seq
+        self.last_ms  = now
 
         if kind == TOUCH_EV_DOWN:
-            self.start_xy  = (px, py)
-            self.anchor    = (px, py)
-            self.start_ms  = time.perf_counter() * 1000.0
-            self.scrolling = False
-            self.axis      = None
-            # Park the cursor on the touched point immediately. A tap will then
-            # click right here, and a slide will send its wheel events to
-            # whatever window is under this point — which is what makes
-            # "scroll the thing I put my finger on" work.
-            move_cursor_abs(*self.panel_to_screen(px, py, mon_left, mon_top, mon_w, mon_h))
+            self.start_xy = (px, py)
+            self.anchor   = (px, py)
+            self.start_ms = now
+            self.mode     = self.UNDECIDED
+            self.axis     = None
+            # Snapshot the real mouse position BEFORE we move anything, so the
+            # gesture can hand the cursor back where it found it.
+            self._borrow_cursor()
+            # Park the cursor on the touched point. A tap then clicks right
+            # here, a hold presses right here, and a slide sends its wheel
+            # events to whatever window is under this point — which is what
+            # makes "scroll the thing I put my finger on" work.
+            self._move(*self.panel_to_screen(px, py, mon_left, mon_top, mon_w, mon_h))
             return
 
         if kind == TOUCH_EV_MOVE:
-            dx = px - self.start_xy[0]
-            dy = py - self.start_xy[1]
-            if not self.scrolling:
+            if self.mode == self.DRAG:
+                # Button is down; just keep the cursor under the finger.
+                self._move(*self.panel_to_screen(px, py, mon_left, mon_top, mon_w, mon_h))
+                return
+
+            if self.mode == self.UNDECIDED:
+                dx = px - self.start_xy[0]
+                dy = py - self.start_xy[1]
                 if (dx * dx + dy * dy) < (TOUCH_TAP_SLOP_PX * TOUCH_TAP_SLOP_PX):
-                    return                  # still inside the tap window
+                    return                  # still inside the tap/hold window
                 # Commit to scrolling and lock the axis to the dominant
                 # direction at the moment of commitment.
-                self.scrolling = True
+                self.mode = self.SCROLL
                 self.axis = 'h' if (TOUCH_HSCROLL_ENABLED and abs(dx) > abs(dy)) else 'v'
                 # Anchor at the ORIGINAL touch point, not here. A fast flick can
                 # cross the slop and travel most of the panel inside a single
                 # 30 Hz report; anchoring to the current point would throw all of
                 # that away. Measuring from the start makes scroll distance equal
                 # total finger travel. The discarded slop is 6 px against a 14 px
-                # notch, so this still can't fire a notch the instant it commits.
+                # notch, so this still cannot fire a notch the instant it commits.
                 self.anchor = self.start_xy
+
+            if self.mode != self.SCROLL:
+                return
 
             ax, ay = self.anchor
             travel = (px - ax) if self.axis == 'h' else (py - ay)
             notches = int(travel / TOUCH_SCROLL_PX_PER_NOTCH)
             if notches:
-                # Only consume the whole notches; the remainder stays in the
-                # anchor so slow drags still accumulate instead of being lost.
+                # Consume only whole notches; the remainder stays in the anchor
+                # so slow drags still accumulate instead of being lost.
                 consumed = notches * TOUCH_SCROLL_PX_PER_NOTCH
                 if self.axis == 'h':
                     self.anchor = (ax + consumed, ay)
@@ -329,11 +494,22 @@ class TouchInjector:
             return
 
         if kind == TOUCH_EV_UP:
-            held_ms = time.perf_counter() * 1000.0 - self.start_ms
-            if not self.scrolling and held_ms <= TOUCH_TAP_MAX_MS:
+            if self.mode == self.DRAG:
+                # Land the drag where the finger actually left the panel, then
+                # let go. reset() would also release, but doing it explicitly
+                # here keeps the drop position exact.
+                self._move(*self.panel_to_screen(px, py, mon_left, mon_top, mon_w, mon_h))
+                mouse_up()
+                self.mode = self.IDLE
+            elif self.mode == self.UNDECIDED and (now - self.start_ms) <= TOUCH_TAP_MAX_MS:
                 # The cursor is already parked at the DOWN point.
                 click_left()
-            self.reset()
+            self.mode     = self.IDLE
+            self.touch_id = None
+            self.axis     = None
+            # Hand the cursor back. Deferred by TOUCH_RESTORE_DELAY_MS so the
+            # click or button-up we just sent is fully processed first.
+            self._schedule_restore()
 
 
 def list_monitor_candidates():
@@ -702,7 +878,19 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 _send_udp(sock, bytes([0xAA, 0xCC, 0x02, touch_state]), (target_ip, PORT))
                 last_touch_send = time.time()
                 if touch_state == 0:
-                    touch.reset()
+                    # Immediate: with touch switched off, tick() would still run
+                    # but there is no reason to make the user wait a frame to
+                    # get their cursor back.
+                    touch.reset(immediate=True)
+
+            # Driven per-frame, not per-packet, and deliberately NOT gated on
+            # touch_state: a finger held perfectly still emits no packets at all
+            # (the ESP suppresses sub-threshold MOVEs), so the hold-to-drag
+            # timer has to be checked from here or it would never fire. This
+            # also runs the stuck-button watchdog and the deferred cursor
+            # restore, and the restore in particular must never be skipped —
+            # it is the thing that gives the mouse back.
+            touch.tick(m_left, m_top, m_w, m_h)
 
             if time.time() - last_debug_send > DEBUG_SEND_INTERVAL_S:
                 _send_udp(sock, bytes([0xAA, 0xCC, 0x01, debug_state]), (target_ip, PORT))
@@ -715,8 +903,16 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             mx, my = get_mouse_pos()
             rx, ry = mx - m_left, my - m_top
             if 0 <= rx < m_w and 0 <= ry < m_h:
-                cv2.circle(frame, (rx, ry), CURSOR_OUTER_R, (255, 255, 255), 2)
-                cv2.circle(frame, (rx, ry), CURSOR_INNER_R, (0, 0, 255), -1)
+                if touch.dragging:
+                    # The only feedback channel that exists: this ring is drawn
+                    # into the frame the ESP is about to display, so the panel
+                    # itself shows when the drag has armed. Without it there is
+                    # no way to tell a held finger from a dead one.
+                    cv2.circle(frame, (rx, ry), CURSOR_OUTER_R + 3, CURSOR_DRAG_COLOR, 2)
+                    cv2.circle(frame, (rx, ry), CURSOR_INNER_R, CURSOR_DRAG_COLOR, -1)
+                else:
+                    cv2.circle(frame, (rx, ry), CURSOR_OUTER_R, (255, 255, 255), 2)
+                    cv2.circle(frame, (rx, ry), CURSOR_INNER_R, (0, 0, 255), -1)
 
             # Vertical monitor → rotate into the ESP's fixed landscape panel
             # (ESP side no longer rotates; it just decodes what it's given).
@@ -835,6 +1031,12 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
 
     except KeyboardInterrupt: pass
     finally:
+        # FIRST thing in teardown: if a drag was in flight when the window was
+        # closed or the process interrupted, the left button is physically down.
+        # Leaving it that way hands the user a desktop stuck mid-drag. Immediate,
+        # because there is no next frame to run a deferred restore on.
+        touch.reset(immediate=True)
+
         # Save JSON settings on exit (excluding transient display index)
         final_settings = {}
         for k in SETTINGS_KEYS:

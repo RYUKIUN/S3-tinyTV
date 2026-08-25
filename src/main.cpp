@@ -358,7 +358,12 @@ void setup() {
     // for. It spends essentially all of its life blocked on the PENIRQ
     // interrupt, so the priority only matters for the brief window in which it
     // holds the SPI bus, and priority inheritance covers that.
-    xTaskCreatePinnedToCore(touchTask,       "TouchTask",    4096, NULL, 1, NULL, 0);
+    // 6 KB rather than 4: the ordinary sampling path needs almost nothing, but a
+    // BOOT-triggered recalibration runs the whole least-squares fit on this
+    // stack (grid arrays + 4x4 double normal equations + float-formatted
+    // printf). Only the rare path is heavy, and a stack overflow there would be
+    // a crash rather than a glitch.
+    xTaskCreatePinnedToCore(touchTask,       "TouchTask",    6144, NULL, 1, NULL, 0);
 
     // ── Decode task (was Arduino loop()) ──────────────────────────────────────
     // Same 8 KB the Arduino loop task used to run on, same core (Core 1),

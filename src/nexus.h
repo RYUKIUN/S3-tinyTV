@@ -172,6 +172,13 @@ const int UDP_PORT = 12345;
 // 50 ms. Raise for snappier presses, lower to give the display more slack.
 #define TOUCH_IDLE_POLL_HZ     20
 #define TOUCH_MOVE_EPS         2     // skip a MOVE report if it moved fewer than this many px
+// Force a MOVE report this often while pressed, even if the finger hasn't moved.
+// Without it, "finger held perfectly still" and "the link just died" look
+// identical to the PC — both are silence — and the PC's stuck-button watchdog
+// cannot tell them apart. That matters during a hold-drag: pausing while
+// dragging a window would otherwise trip the watchdog and drop it. Two packets
+// per second during a stationary press is nothing next to the video stream.
+#define TOUCH_KEEPALIVE_MS     500
 #define TOUCH_RELEASE_SAMPLES  2     // consecutive empty reads before declaring release (debounce)
 // Consecutive VALID reads before declaring a press. 1 = fire immediately.
 // Only worth raising while PENIRQ is unwired: with no interrupt to corroborate
@@ -180,6 +187,28 @@ const int UDP_PORT = 12345;
 // makes a stray click essentially impossible, at the cost of one extra poll
 // period (~50 ms at TOUCH_IDLE_POLL_HZ) before a press registers.
 #define TOUCH_PRESS_SAMPLES    1
+
+// ── Calibration ───────────────────────────────────────────────────────────
+// Grid resolution: 3 -> 9 targets, 4 -> 16. Simulating a twisted resistive
+// panel with realistic tap and ADC noise, mean error across the panel came out
+// at 1.93 px for the old 4-corner affine fit, 1.68 px for a 9-point bilinear
+// fit, and 1.26 px at 16 points (worst-case 6.05 -> 4.82 -> 4.43 px). Most of
+// the residual is human tap scatter rather than model error, which is exactly
+// what more points average away. 16 taps is a slower one-time setup for a
+// meaningfully steadier result; drop to 3 if you would rather it were quicker.
+#define TOUCH_CAL_GRID         4
+// Inset of the outermost targets from the panel edge, in pixels. Resistive
+// panels get noisy and non-linear right at the very edge, so don't put targets
+// in the last few pixels — but don't pull them too far in either, or the fit is
+// extrapolating everywhere near the border.
+#define TOUCH_CAL_INSET        26
+// Raw ADC reads averaged per target (median-filtered, settling reads dropped).
+#define TOUCH_CAL_SAMPLES      16
+// If the fit's RMS residual is worse than this many pixels, one of the taps was
+// probably bad — redo the whole run rather than saving a calibration that will
+// annoy you every day. Bounded by TOUCH_CAL_MAX_RETRY so it can't loop forever.
+#define TOUCH_CAL_MAX_RMS      6.0f
+#define TOUCH_CAL_MAX_RETRY    2
 #define TOUCH_BUS_WAIT_MS      25    // max wait for the SPI bus; display always holds priority
 #define TOUCH_EVENT_QUEUE_LEN  8     // touchTask -> networkTask handoff depth
 

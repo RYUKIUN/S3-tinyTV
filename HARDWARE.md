@@ -131,11 +131,55 @@ extra poll period.
 
 ### Calibration
 
-LovyanGFX `calibrateTouch()` (4 corner taps) → `uint16_t[8]` → NVS, namespace
-`touch`, key `cal`, magic `0x9341` + version. Runs automatically on first boot
-if nothing is stored, before WiFi and before any task exists. To redo it,
-**double-press the BOOT button while the board is not yet streaming**; the
-button is dead once the stream is live, so it can't be tripped mid-session.
+**Not** LovyanGFX's `calibrateTouch()`. That samples 4 corners and fits a
+strictly affine transform, which has two problems: with no redundancy every
+tap's error lands straight in the transform, and affine cannot express the
+gentle *twist* real resistive panels have (x drifting with y and vice versa) —
+which is exactly why a 4-corner calibration feels sharp at the corners and
+vague toward the middle of the edges.
+
+Instead: a `TOUCH_CAL_GRID`² grid (default **4×4 = 16 targets**), median of
+`TOUCH_CAL_SAMPLES` raw reads per target with the settling reads dropped,
+least-squares fit to a **bilinear** model with one cross term per axis:
+
+```
+sx = a0 + a1*u + a2*v + a3*u*v        u,v = raw ADC / 4096
+sy = b0 + b1*u + b2*v + b3*u*v
+```
+
+Raw values are normalised before fitting — the `u*v` term would otherwise span
+~1.6 × 10⁷ next to a constant term of 1 and wreck the conditioning of the normal
+equations in float. The 4×4 systems are solved in double by Gaussian elimination
+with partial pivoting. The model degenerates to affine if the cross terms fit to
+~0, so it can only match or beat the old behaviour.
+
+Because the fit maps raw → *final screen* coordinates directly, panel rotation
+is baked in and there is no LovyanGFX transform convention to get wrong. At
+runtime `readPoint()` calls `getTouchRaw()` and applies the fit itself.
+
+Simulated against a twisted panel with realistic tap and ADC noise:
+
+| fit | mean err | p95 | worst |
+|---|---|---|---|
+| 4 corners, affine (old) | 1.93 px | 3.92 px | 6.05 px |
+| 9-point, bilinear | 1.68 px | 3.25 px | 4.82 px |
+| **16-point, bilinear (current)** | **1.26 px** | **2.67 px** | **4.43 px** |
+
+Most of the residual is human tap scatter rather than model error, which is what
+more points average away — hence 16 rather than 9.
+
+The run reports its own **RMS residual** on screen when it finishes. If that
+exceeds `TOUCH_CAL_MAX_RMS` (6 px) a tap almost certainly landed off its marker,
+so the whole run repeats rather than persisting a calibration that is already
+measurably wrong — bounded by `TOUCH_CAL_MAX_RETRY`.
+
+Stored in NVS, namespace `touch`, key `cal`, magic `0x9341` + **version 2**.
+Version 1 blobs (the old 4-corner `uint16_t[8]`) fail the check and trigger a
+fresh run, which is the desired upgrade path. To redo it deliberately,
+**double-press BOOT while the board is not yet streaming**.
+
+`touchTask` gets a 6 KB stack rather than 4 KB because this fit runs on it when
+triggered by BOOT — the sampling path itself needs almost nothing.
 
 ### Reporting to the PC
 
@@ -154,9 +198,47 @@ video sender is already using (no second socket, no extra thread):
 `networkTask` drains it, keeping the socket owned by exactly one task.
 
 Events are sent only while a finger is down, capped at 30 Hz, and suppressed
-entirely when the point hasn't moved by `TOUCH_MOVE_EPS`. That is ~1.5 KB/s and
-~30 pps against the stream's ~420 KB/s and ~300 pps — **~0.35% of bandwidth
-during a touch, and nothing at all the rest of the time.**
+entirely when the point hasn't moved by `TOUCH_MOVE_EPS` — apart from a
+`TOUCH_KEEPALIVE_MS` (500 ms) heartbeat while pressed. The heartbeat exists
+because otherwise "finger held perfectly still" and "the link died" are both
+just silence, and the PC's stuck-button watchdog cannot tell them apart; without
+it, pausing during a hold-drag would drop the window you were dragging.
+
+That is ~1.5 KB/s and ~30 pps against the stream's ~420 KB/s and ~300 pps —
+**~0.35% of bandwidth during a touch**, 2 pps while holding still, and nothing
+at all the rest of the time.
+
+Gestures (all decided PC-side, in `captureJpeg.py`): tap → left click, slide →
+scroll wheel, **hold still past `TOUCH_HOLD_MS` → press-and-hold drag**. A press
+commits to exactly one of the three. The drag has two independent safety
+releases — a watchdog if the ESP goes quiet, and an unconditional release in the
+Python teardown — because a left button left stuck down would strand the user's
+desktop mid-drag.
+
+### Cursor borrowing
+
+Windows has exactly one system cursor — there is no second, independent pointer
+to inject into, so a touch unavoidably moves the user's real cursor to the
+mirrored monitor. Rather than leave it stolen, `TouchInjector` **borrows and
+returns** it: `_borrow_cursor()` snapshots `GetCursorPos()` before the first
+injected move, and `_do_restore()` puts the cursor back once the gesture ends.
+
+Three details make this behave:
+
+- The restore is **deferred** by `TOUCH_RESTORE_DELAY_MS` (40 ms) and executed
+  from `tick()`, not inline. Apps frequently read the cursor position while
+  handling the click or button-up they were just sent; snapping away in the same
+  instant can land the click at the restored position instead.
+- If the cursor is not within `TOUCH_RESTORE_TOLERANCE_PX` of where we last put
+  it, the user has grabbed their physical mouse mid-gesture, so the restore is
+  **abandoned**. The goal is to stop fighting the mouse, not to fight it in a
+  new way.
+- `_borrow_cursor()` **cancels a still-pending restore instead of re-snapshotting**.
+  Otherwise back-to-back taps would capture the position we ourselves had just
+  injected, and the restore target would walk across the screen.
+
+`tick()` is therefore called unconditionally every frame, *not* gated on the
+"Enable Touch" state — it is the only thing that hands the cursor back.
 
 The PC can switch reporting off at the source via the existing control channel
 (`0xAA 0xCC 0x02 <0|1>`), driven by the "Enable Touch" trackbar.
