@@ -32,6 +32,7 @@
 #include "display.h"
 #include "network.h"
 #include "jpeg_decode.h"
+#include "touch.h"
 #include <ArduinoOTA.h>
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
@@ -61,6 +62,14 @@ SemaphoreHandle_t slotFree[MM_MAX_JPEG_SLOTS];       // only [0..g_numJpegSlots-
 
 // Display pipeline: Core 1 posts here when all 4 tiles are ready.
 QueueHandle_t displayQueue;      // depth = g_numDisplayBufs
+
+// Shared SPI bus ownership (display DMA vs touch read) - see nexus.h.
+SemaphoreHandle_t g_spiMutex = nullptr;
+
+// Touch pipeline: touchTask posts here, networkTask puts the events on the wire.
+QueueHandle_t     touchQueue        = nullptr;
+volatile bool     g_touchEnabled    = true;   // PC can switch this off at runtime
+volatile bool     g_touchCalibrated = false;
 
 // ─────────────────────────────────────────────
 //  PER-CORE CPU UTILISATION
@@ -175,10 +184,26 @@ void setup() {
     while (!Serial && (millis() - t0) < 2000) delay(10);
     Serial.println("\n[BOOT] ping-pong pipeline (direct-to-PSRAM decode, BE pixels)");
 
+    // Created before anything can draw: every path that touches the SPI bus
+    // goes through this, and display.cpp's helpers null-check it only so that a
+    // pre-creation draw can't fault. A real mutex (not a binary semaphore) so
+    // the display inherits priority over the touch sampler when it wants the bus.
+    g_spiMutex = xSemaphoreCreateMutex();
+    touchQueue = xQueueCreate(TOUCH_EVENT_QUEUE_LEN, sizeof(TouchEvent));
+
     lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
+
+    // Touch calibration: loads from NVS, or runs the interactive corner-tap if
+    // nothing is stored. Deliberately here - pre-WiFi, pre-pipeline, before any
+    // task exists and while nothing else can want the bus. It runs BEFORE
+    // drawBootHeader() because calibration owns the whole screen and would
+    // otherwise wipe a header we'd just drawn.
+    touchBegin();
+
     drawBootHeader();
-    statusLine(0, "Display:", "OK", TFT_GREEN);
+    statusLine(0, "Display:", g_touchCalibrated ? "OK + Touch" : "OK (no touch cal)",
+               g_touchCalibrated ? TFT_GREEN : TFT_YELLOW);
 
     bool psramOk = psramFound();
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
@@ -327,6 +352,13 @@ void setup() {
     xTaskCreatePinnedToCore(networkTask,     "NetTask",     10240, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(wifiWatchdogTask,"WifiWatchdog", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 2, NULL, 0);
+
+    // Touch sampler: Core 0, priority 1 - strictly below displayTask (2) and
+    // networkTask (3), exactly as the integration plan in HARDWARE.md called
+    // for. It spends essentially all of its life blocked on the PENIRQ
+    // interrupt, so the priority only matters for the brief window in which it
+    // holds the SPI bus, and priority inheritance covers that.
+    xTaskCreatePinnedToCore(touchTask,       "TouchTask",    4096, NULL, 1, NULL, 0);
 
     // ── Decode task (was Arduino loop()) ──────────────────────────────────────
     // Same 8 KB the Arduino loop task used to run on, same core (Core 1),

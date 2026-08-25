@@ -33,6 +33,7 @@ It started as a simple "mirror my screen to a small display" idea and turned int
 - **Dual-core FreeRTOS architecture** — Core 0 owns networking, display DMA, and OTA; Core 1 is dedicated entirely to decode. Fully task-based, no reliance on the Arduino framework's implicit loop.
 - **Self-healing frame recovery** — if a tile fails to decode or arrive in time (network hiccup, decoder falling behind under load), the pipeline falls back to the last known-good pixels for just that tile instead of showing corrupted or torn video.
 - **Zero-copy decode path** — JPEG MCUs are decoded directly into the display framebuffer in the panel's native pixel format; no intermediate scratch buffer, no byte-swap pass.
+- **Touchscreen drives the PC** — the XPT2046 panel acts as a remote input device for the machine it's mirroring: tap to left-click wherever you touched, slide to scroll. It shares the display's SPI bus, but the display always wins it: `displayTask` holds a priority-inheriting mutex across its entire DMA push, so touch can delay a frame by at most one 456 µs read, and only while a finger is down. The sampler polls at 20 Hz while idle (~0.9% bus occupancy); once the PENIRQ line is wired and `TOUCH_USE_IRQ` is flipped to 1 in `nexus.h`, it sleeps on the interrupt instead and an untouched panel costs zero CPU and zero SPI traffic. Events go out over the existing UDP socket at ~0.35% of the video stream's bandwidth. Toggle it live with the **Enable Touch** control in the PC UI.
 - **OTA wireless updates** — reflash the firmware over WiFi after the first USB flash; no physical access needed.
 - **Live diagnostics** — the ESP streams back FPS, decode time, per-core CPU load, temperature, memory headroom, and drop/abort counters, rendered as an on-screen debug overlay on the PC sender.
 
@@ -117,6 +118,7 @@ src/
   network.cpp/.h      UDP receive, tile chunk reassembly, WiFi watchdog
   jpeg_decode.cpp/.h  per-tile JPEG decode → PSRAM framebuffer
   display.cpp/.h      LovyanGFX panel driver, DMA display task
+  touch.cpp/.h        XPT2046 sampler, calibration, touch → PC event reporting
 captureJpeg.py         PC-side capture / encode / send + live control UI
 requirements.txt       Python dependencies (pip install -r requirements.txt)
 HARDWARE.md            pin wiring, SPI config, memory budget

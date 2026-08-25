@@ -27,7 +27,7 @@ Driven via LovyanGFX (`LGFX` class in `src/display.h`), **not** Adafruit_GFX. Al
 |---|---|---|
 | SCLK | 12 | `LCD_PIN_SCLK` |
 | MOSI | 13 | `LCD_PIN_MOSI` |
-| MISO | -1 (not connected) | `LCD_PIN_MISO` — display is write-only; nothing reads back from the panel |
+| MISO | -1 for the *panel* | `LCD_PIN_MISO` — the panel is write-only. The **bus** does carry MISO (GPIO 11) for the touch controller; see the note under Touch |
 | CS | 10 | `LCD_PIN_CS` |
 | DC | 4 | `LCD_PIN_DC` |
 | RST | 5 | `LCD_PIN_RST` |
@@ -39,34 +39,127 @@ Driven via LovyanGFX (`LGFX` class in `src/display.h`), **not** Adafruit_GFX. Al
   jumper-wire wiring; raise in ~10 MHz steps if your wiring can carry it —
   see the comment in `nexus.h`)
 - Panel native size: 240×320 (`LCD_PANEL_W`/`LCD_PANEL_H`); software rotation 3 → logical 320×240 landscape
-- `dummy_read_pixel = 8`, `readable = false`, `bus_shared = true` (bus left shareable — was set up anticipating a touch controller on the same bus; see below)
+- `dummy_read_pixel = 8`, `readable = false`, `bus_shared = true` (touch now actually shares this bus — see below)
 - Color depth: 16-bit (RGB565), `RGB565_BIG_ENDIAN` used throughout the decode pipeline to match the panel's native SPI byte order
 
 No other GPIOs are used anywhere in the active `src/` codebase (network, decode, display, OTA) — confirmed by search at the time of writing.
 
-## Touch — XPT2046 (stashed, not yet integrated)
+## Touch — XPT2046 (integrated)
 
-Pin plan carried over from the separate `test unit-S3` reference project.
-**Not wired into the main firmware yet** — this is the plan from the
-stashed touch-integration task, recorded here for whenever that work
-resumes.
+Driven by LovyanGFX's own `Touch_XPT2046`, attached to the `LGFX` class in
+[`src/display.h`](src/display.h) — **not** the `XPT2046_Touchscreen` library the
+`test unit-S3` reference project uses. Sharing LovyanGFX's bus object avoids
+mixing an Arduino `SPI` instance with LovyanGFX's `Bus_SPI` on the same host,
+and brings 7-sample hardware median filtering and affine calibration for free.
 
-| Signal | GPIO | Notes |
+| Signal | GPIO | `nexus.h` macro |
 |---|---|---|
-| TOUCH_CS | 9 | XPT2046 chip select |
-| TOUCH_IRQ | 8 | touch interrupt (plan: use this to gate polling — only read the controller when it signals a touch, rather than blind-polling) |
-| TOUCH_MISO | 11 | shared bus MISO — the display's own MISO is unused (-1), so this would need enabling on the shared `SPI2_HOST` bus config in `display.h`, or moving to an isolated bus |
+| CS | 9 | `TOUCH_PIN_CS` |
+| IRQ (PENIRQ) | 8 | `TOUCH_PIN_IRQ` — **currently NOT connected**; see below |
+| MISO | 11 | `TOUCH_PIN_MISO` |
+| SCLK / MOSI | 12 / 13 | shared with the panel |
+| BOOT button | 0 | `BOOT_PIN` — double-press before streaming starts to recalibrate |
 
-Decision reached during planning: share the existing `SPI2_HOST` bus
-(SCLK 12 / MOSI 13, display CS 10, touch CS 9) rather than isolate touch
-onto a separate SPI host — bus lock (`use_lock = true`) already
-serializes access safely, and touch polling is infrequent/small relative
-to the display's periodic DMA pushes, so contention risk is low. No pin
-conflicts either way; GPIO 8/9/11 are free.
+- Read clock: 1 MHz (`TOUCH_SPI_HZ`). One read is 57 bytes ≈ **456 µs**.
+- **MISO is declared on the panel's bus config**, not just the touch config.
+  LovyanGFX's `spi::init()` guards `spi_bus_initialize()` behind "does this host
+  already have a device handle", so the second call — the one `initTouch()`
+  makes — cannot retrofit MISO into the IDF bus configuration. Declaring it on
+  the first init is load-bearing.
 
-Planned integration: touch read as its own low-priority FreeRTOS task on
-Core 0, priority below `displayTask`/`networkTask` so display DMA always
-wins over touch responsiveness.
+### Bus arbitration — the display always wins
+
+`Panel_Device::getTouchRaw()` calls `endTransaction()` if a write is open, which
+from *another task*, mid-`pushPixelsDMA`, would tear the frame and desync
+`displayTask`'s `startWrite`/`endWrite` pairing. LovyanGFX's own bus lock does
+not cover an async DMA that spans several loop iterations.
+
+So ownership is explicit: **`g_spiMutex`** (`nexus.h`). `displayTask` holds it
+across the entire push (`startWrite` → DMA → `waitDMA` → `endWrite`);
+`touchTask` takes it around each read, waiting up to `TOUCH_BUS_WAIT_MS` (25 ms)
+and treating a timeout as "skip this sample", never as a release. Every other
+path that draws — `statusLine()`, `drawBootHeader()` — goes through the same
+mutex, because those are called from `decodeTask` (Core 1) and
+`wifiWatchdogTask` (Core 0).
+
+It is a real mutex rather than a binary semaphore specifically so **priority
+inheritance** applies: when `displayTask` (prio 2) wants a bus held by
+`touchTask` (prio 1), touch is boosted and hands it back within one read. That
+456 µs is the hard upper bound on how much touch can ever delay a frame, and it
+only applies while a finger is actually down.
+
+### Cost
+
+- **Idle (PENIRQ wired, `TOUCH_USE_IRQ` = 1): exactly zero.** `touchTask` blocks
+  on a PENIRQ falling-edge interrupt — no polling, no SPI traffic, no CPU. The
+  interrupt is detached for the duration of a press (PENIRQ stays low
+  throughout, which would otherwise storm) and re-attached on release.
+- **Idle (PENIRQ unwired, `TOUCH_USE_IRQ` = 0 — the current setting):** one full
+  read per poll at `TOUCH_IDLE_POLL_HZ` (20 Hz) → ~0.9% bus occupancy, and up to
+  50 ms of extra touch-down latency.
+- **While touched:** one read per 33 ms (`TOUCH_REPORT_HZ` = 30) → ~1.4% bus
+  occupancy. Identical in both modes.
+- **Memory:** +704 B static RAM, +11.4 KB flash, +4 KB task stack from the
+  internal heap. Measured against `7089fbe`. The stack is allocated *after* the
+  JPEG slots, so it cannot push the slot count into its fallback path.
+
+### PENIRQ is currently not connected
+
+`TOUCH_USE_IRQ` in `nexus.h` is **0** because the IRQ line isn't wired yet.
+Flipping it to **1** is the only change needed once it is.
+
+This flag is not just an efficiency knob. `Touch_XPT2046::getTouchRaw()` opens
+with:
+
+```c
+if (_cfg.pin_int >= 0 && gpio_in(_cfg.pin_int)) return 0;
+```
+
+A configured-but-floating PENIRQ reads high, so **every read would report "not
+touched"** and touch would look completely dead. With the flag at 0 the driver
+gets `pin_int = -1` and never consults the line, and the firmware leaves GPIO 8
+entirely alone — no `pinMode`, no pull-up, no interrupt.
+
+Touch detection itself does not depend on PENIRQ: the XPT2046 measures pressure,
+and the driver already requires ≥3 valid X, Y and Z samples out of 7 plus a
+non-zero Z before reporting a point. What is lost is only the cheap "is anything
+touching?" test, so idle detection has to be polled.
+
+If stray clicks ever show up in this mode, raise `TOUCH_PRESS_SAMPLES` to 2 —
+it requires two corroborating reads before a press commits, at the cost of one
+extra poll period.
+
+### Calibration
+
+LovyanGFX `calibrateTouch()` (4 corner taps) → `uint16_t[8]` → NVS, namespace
+`touch`, key `cal`, magic `0x9341` + version. Runs automatically on first boot
+if nothing is stored, before WiFi and before any task exists. To redo it,
+**double-press the BOOT button while the board is not yet streaming**; the
+button is dead once the stream is live, so it can't be tripped mid-session.
+
+### Reporting to the PC
+
+Raw events only — `DOWN` / `MOVE` / `UP` with panel coordinates. All gesture
+interpretation (tap → click, slide → scroll) lives in `captureJpeg.py` so it can
+be retuned without an OTA reflash.
+
+Wire format, 9 bytes, sent on the **existing** UDP socket to the address the
+video sender is already using (no second socket, no extra thread):
+
+```
+0xAA 0xDD <kind> <touchId> <seq> <xHi> <xLo> <yHi> <yLo>
+```
+
+`touchTask` never calls `sendto()` itself — it posts to `touchQueue` and
+`networkTask` drains it, keeping the socket owned by exactly one task.
+
+Events are sent only while a finger is down, capped at 30 Hz, and suppressed
+entirely when the point hasn't moved by `TOUCH_MOVE_EPS`. That is ~1.5 KB/s and
+~30 pps against the stream's ~420 KB/s and ~300 pps — **~0.35% of bandwidth
+during a touch, and nothing at all the rest of the time.**
+
+The PC can switch reporting off at the source via the existing control channel
+(`0xAA 0xCC 0x02 <0|1>`), driven by the "Enable Touch" trackbar.
 
 ## Networking
 
@@ -81,7 +174,7 @@ wins over touch responsiveness.
 
 | Core | Tasks |
 |---|---|
-| Core 0 | `networkTask` (priority 3), `displayTask` (priority 2), `otaTask` (priority 1), `wifiWatchdogTask` (priority 1) |
+| Core 0 | `networkTask` (priority 3), `displayTask` (priority 2), `otaTask` (priority 1), `wifiWatchdogTask` (priority 1), `touchTask` (priority 1) |
 | Core 1 | `decodeTask` (priority 2) — JPEG tile decode, formerly Arduino `loop()` |
 
 ## Memory Budget (approximate, at time of writing)

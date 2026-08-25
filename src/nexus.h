@@ -60,7 +60,10 @@
 
 #define LCD_PIN_SCLK    12
 #define LCD_PIN_MOSI    13
-#define LCD_PIN_MISO    -1          // -1 = not connected (display is write-only)
+#define LCD_PIN_MISO    -1          // the PANEL is write-only and never read.
+                                    // The shared BUS does get a MISO line, but
+                                    // it belongs to the touch controller — see
+                                    // TOUCH_PIN_MISO below and display.h.
 #define LCD_PIN_DC      4           // data/command
 #define LCD_PIN_CS      10          // chip select
 #define LCD_PIN_RST     5           // reset
@@ -72,6 +75,38 @@
 // change orientation.
 #define LCD_PANEL_W     240
 #define LCD_PANEL_H     320
+
+// ── Touch wiring — XPT2046 on the SAME SPI bus as the display ────────────
+// The touch controller shares SCLK/MOSI with the panel and has its own CS.
+// This is deliberate: LovyanGFX's bus lock already serialises access, and a
+// touch read is 57 bytes at 1 MHz (~456 us) against the display's 150 KB
+// DMA pushes — sharing costs far less than burning a second SPI host.
+//
+// MISO matters here. The panel is write-only (LCD_PIN_MISO = -1), but the
+// XPT2046 has to be *read*, so the shared bus needs a MISO line after all.
+// LovyanGFX's touch init adds it to the host; the panel simply never uses it.
+#define TOUCH_PIN_CS    9
+#define TOUCH_PIN_IRQ   8           // PENIRQ — low while the panel is pressed
+
+// ── PENIRQ: wired or not? ────────────────────────────────────────────────
+// 0 = PENIRQ is NOT usable (not connected / shorted). The driver is told
+//     pin_int = -1 and touchTask polls instead.
+// 1 = PENIRQ is properly wired. The driver gates on it and touchTask sleeps
+//     on the interrupt, which costs literally nothing while untouched.
+//
+// This MUST be 0 while the line is unwired. It is not merely an
+// optimisation flag: Touch_XPT2046::getTouchRaw() opens with
+//     if (_cfg.pin_int >= 0 && gpio_in(_cfg.pin_int)) return 0;
+// so a configured-but-floating PENIRQ reads high and makes every single read
+// report "not touched" — touch would appear completely dead, not just less
+// efficient. Flipping this to 1 is the ONLY change needed once it's fixed.
+#define TOUCH_USE_IRQ   0
+#define TOUCH_PIN_MISO  11          // shared-bus MISO (display doesn't use it)
+#define TOUCH_SPI_HZ    1000000     // XPT2046 max is ~2 MHz; 1 MHz is the safe default
+
+// BOOT button (GPIO0 on every ESP32-S3 devkit). Double-press it before the
+// stream starts to force a touch recalibration — see touch.cpp.
+#define BOOT_PIN        0
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ZONE 2 — CHANGE THESE IF YOUR HARDWARE SETUP DIFFERS
@@ -121,6 +156,37 @@ const int UDP_PORT = 12345;
 #define OVERLAY_FLASH_MS         1000
 #define TILE_TIMEOUT_MS          200
 #define WIFI_CONNECT_TIMEOUT_MS  150000   // how long to wait for WiFi before restarting
+
+// ── Touch → PC mouse ──────────────────────────────────────────────────────
+// Budget note: the video stream runs ~300 packets/s and ~420 KB/s. Touch is
+// deliberately kept ~3 orders of magnitude below that. Events are sent ONLY
+// while a finger is actually down, capped at TOUCH_REPORT_HZ, and suppressed
+// entirely when the point hasn't moved. A 9-byte payload at 30 Hz is ~1.5 KB/s
+// on the wire — 0.35% of the stream's bandwidth, and 0% when nobody's touching.
+#define TOUCH_REPORT_HZ        30    // max MOVE reports/sec while pressed (DOWN/UP always sent)
+// Idle sampling rate, used ONLY when TOUCH_USE_IRQ is 0. With PENIRQ wired,
+// idle detection is interrupt-driven and this is ignored entirely.
+// Each idle poll is one full 57-byte read (~456 us at 1 MHz), because without
+// PENIRQ the driver has no cheap way to know the panel is untouched. 20 Hz
+// costs ~0.9% SPI bus occupancy at idle and puts touch-down latency at up to
+// 50 ms. Raise for snappier presses, lower to give the display more slack.
+#define TOUCH_IDLE_POLL_HZ     20
+#define TOUCH_MOVE_EPS         2     // skip a MOVE report if it moved fewer than this many px
+#define TOUCH_RELEASE_SAMPLES  2     // consecutive empty reads before declaring release (debounce)
+// Consecutive VALID reads before declaring a press. 1 = fire immediately.
+// Only worth raising while PENIRQ is unwired: with no interrupt to corroborate
+// it, press detection rests entirely on the XPT2046's pressure reading, and a
+// single spurious sample would become a real click on the PC. Setting this to 2
+// makes a stray click essentially impossible, at the cost of one extra poll
+// period (~50 ms at TOUCH_IDLE_POLL_HZ) before a press registers.
+#define TOUCH_PRESS_SAMPLES    1
+#define TOUCH_BUS_WAIT_MS      25    // max wait for the SPI bus; display always holds priority
+#define TOUCH_EVENT_QUEUE_LEN  8     // touchTask -> networkTask handoff depth
+
+// Touch event kinds — must match the PC side's TOUCH_EV_* in captureJpeg.py.
+#define TOUCH_EV_DOWN  0
+#define TOUCH_EV_MOVE  1
+#define TOUCH_EV_UP    2
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ZONE 4 — INTERNAL PLUMBING
@@ -201,6 +267,39 @@ extern int   g_sock;
 extern struct sockaddr_in g_remoteAddr;
 extern bool  g_remoteAddrValid;
 extern float stat_jitter;
+
+// ── Shared SPI bus arbitration ───────────────────────────────────────────────
+// The display and the touch controller sit on the same SPI host, but the
+// display's transfer is an ASYNC DMA push: pushPixelsDMA() returns while bytes
+// are still going out, and displayTask keeps its startWrite() open across
+// several loop iterations until dmaBusy() clears. LovyanGFX's own bus lock does
+// not cover that window, and Panel_Device::getTouchRaw() would happily call
+// endTransaction() mid-DMA from another task — tearing the frame and desyncing
+// displayTask's startWrite/endWrite pairing.
+//
+// So bus ownership is arbitrated explicitly: displayTask holds this mutex for
+// the ENTIRE push (startWrite -> DMA -> waitDMA -> endWrite), and touchTask
+// takes it around its read. It's a real mutex, not a binary semaphore, so
+// priority inheritance applies: if the display wants the bus while touch holds
+// it, touch is boosted and hands it back within one 456 us read. That's the
+// hard upper bound on how much touch can ever delay a frame.
+extern SemaphoreHandle_t g_spiMutex;
+
+// ── Touch pipeline ───────────────────────────────────────────────────────────
+// touchTask produces these; networkTask drains the queue and puts them on the
+// wire. Touch never calls sendto() itself — the socket stays owned by the one
+// task that already runs on the core the LWIP stack lives on, so there's no
+// concurrent-socket question and no second task blocking in the network stack.
+struct TouchEvent {
+    uint8_t  kind;    // TOUCH_EV_DOWN / _MOVE / _UP
+    uint8_t  touchId; // increments on every new press; lets the PC spot a lost DOWN
+    uint8_t  seq;     // per-touch sequence; lets the PC drop UDP-reordered stragglers
+    uint16_t x, y;    // panel coordinates, 0..SCREEN_W-1 / 0..SCREEN_H-1
+};
+
+extern QueueHandle_t     touchQueue;
+extern volatile bool     g_touchEnabled;   // set by the PC over the 0xAA 0xCC control channel
+extern volatile bool     g_touchCalibrated;
 
 // ── Display double-buffer write index (Core-1 exclusive) ─────────────────────
 extern uint8_t writeSet;

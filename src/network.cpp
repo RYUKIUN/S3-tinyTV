@@ -31,6 +31,36 @@ static IRAM_ATTR int assembleTileInto(uint8_t t, uint8_t* dst) {
     return offset;
 }
 
+// Drains touchTask's queue onto the wire. Called from networkTask's own loop so
+// the UDP socket is only ever used by one task.
+//
+// Bandwidth note: 9 bytes of payload (51 on the wire with UDP+IP+Ethernet
+// headers), sent ONLY while a finger is down and capped at TOUCH_REPORT_HZ.
+// That is ~1.5 KB/s and ~30 pps against the video stream's ~420 KB/s and
+// ~300 pps - about 0.35% of bandwidth during a touch, and exactly nothing the
+// rest of the time. Draining is bounded per call so a burst can never stall
+// the receive loop.
+static void flushTouchEvents() {
+    if (!g_remoteAddrValid || touchQueue == nullptr) return;
+
+    TouchEvent ev;
+    uint8_t    pkt[9];
+    for (int i = 0; i < TOUCH_EVENT_QUEUE_LEN; i++) {
+        if (xQueueReceive(touchQueue, &ev, 0) != pdTRUE) break;
+        pkt[0] = 0xAA;
+        pkt[1] = 0xDD;
+        pkt[2] = ev.kind;
+        pkt[3] = ev.touchId;
+        pkt[4] = ev.seq;
+        pkt[5] = (uint8_t)(ev.x >> 8);
+        pkt[6] = (uint8_t)(ev.x & 0xFF);
+        pkt[7] = (uint8_t)(ev.y >> 8);
+        pkt[8] = (uint8_t)(ev.y & 0xFF);
+        sendto(g_sock, pkt, sizeof(pkt), 0,
+               (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
+    }
+}
+
 void networkTask(void*) {
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock < 0) { vTaskDelete(NULL); return; }
@@ -60,6 +90,10 @@ void networkTask(void*) {
                          (struct sockaddr*)&sender, &slen);
 
         if (n < 0) {
+            // Idle path: nothing inbound. Touch events still have to get out
+            // promptly, and the 1 ms select() below bounds the added latency.
+            flushTouchEvents();
+
             fd_set rfds; FD_ZERO(&rfds); FD_SET(g_sock, &rfds);
             struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
             select(g_sock + 1, &rfds, NULL, NULL, &tv);
@@ -86,6 +120,10 @@ void networkTask(void*) {
 
         if (rxBuf[1] == 0xCC) {
             if (n >= 4 && rxBuf[2] == 0x01) debugEnabled = (rxBuf[3] == 1);
+            // 0x02: PC-side "Enable Touch" switch. When off, touchTask stops
+            // posting events at the source, so a disabled touchscreen costs
+            // nothing on the wire and nothing in this loop.
+            if (n >= 4 && rxBuf[2] == 0x02) g_touchEnabled = (rxBuf[3] == 1);
             portYIELD();
             continue;
         }
@@ -204,6 +242,11 @@ void networkTask(void*) {
                 tiles[i].stat_decoded = tiles[i].stat_corrupt = tiles[i].stat_timeout = 0;
             lastStatMs = millis();
         }
+
+        // Busy path: a packet just arrived, so we are about to loop straight
+        // back into recvfrom() and would otherwise not revisit the idle drain
+        // for as long as the stream keeps us fed.
+        flushTouchEvents();
 
         portYIELD();
     }
