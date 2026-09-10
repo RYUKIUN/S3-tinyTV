@@ -2107,7 +2107,13 @@ mcu_done:
 // For 1/4 and 1/8 scaled images, we don't store most of the AC values since we
 // won't use them. For skipped MCUs (outside crop area), we don't decode any AC values
 //
-static int JPEGDecodeMCU(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
+#if JPEG_PROFILE
+volatile uint32_t g_jpegHuffCycles = 0;
+volatile uint32_t g_jpegIdctCycles = 0;
+#include <xtensa/core-macros.h>
+#endif
+
+static int JPEGDecodeMCU_impl(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
 {
     my_ulong ulCode, ulTemp;
     uint8_t *pZig;
@@ -2292,10 +2298,22 @@ mcu_done:
     pJPEG->u16MCUFlags = u16MCUFlags;
     return 0;
 } /* JPEGDecodeMCU() */
+
+static int JPEGDecodeMCU(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
+{
+#if JPEG_PROFILE
+    uint32_t t0 = XTHAL_GET_CCOUNT();
+    int r = JPEGDecodeMCU_impl(pJPEG, iMCU, iDCPredictor);
+    g_jpegHuffCycles += XTHAL_GET_CCOUNT() - t0;
+    return r;
+#else
+    return JPEGDecodeMCU_impl(pJPEG, iMCU, iDCPredictor);
+#endif
+}
 //
 // Inverse DCT
 //
-static void JPEGIDCT(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable)
+static void JPEGIDCT_impl(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable)
 {
     int iRow;
     signed int tmp6,tmp7,tmp10,tmp11,tmp12,tmp13;
@@ -2825,6 +2843,17 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
         pOutput += 8;
     } // for each row
 } /* JPEGIDCT() */
+
+static void JPEGIDCT(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable)
+{
+#if JPEG_PROFILE
+    uint32_t t0 = XTHAL_GET_CCOUNT();
+    JPEGIDCT_impl(pJPEG, iMCUOffset, iQuantTable);
+    g_jpegIdctCycles += XTHAL_GET_CCOUNT() - t0;
+#else
+    JPEGIDCT_impl(pJPEG, iMCUOffset, iQuantTable);
+#endif
+}
 static void JPEGPutMCU8BitGray(JPEGIMAGE *pJPEG, int x, int iPitch)
 {
     int i, j, xcount, ycount;

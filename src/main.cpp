@@ -113,6 +113,8 @@ uint8_t*  tileChunkStorage[NUM_TILES] = {};
 //  CROSS-CORE STATS DEFINITIONS
 // ─────────────────────────────────────────────
 volatile uint32_t g_avgDecodeUs     = 0;  // avg tile decode us (excl. pushImage)
+volatile uint32_t g_avgHuffUs       = 0;  // avg Huffman-decode portion of g_avgDecodeUs (JPEG_PROFILE only, else 0)
+volatile uint32_t g_avgIdctUs       = 0;  // avg IDCT portion of g_avgDecodeUs (JPEG_PROFILE only, else 0)
 volatile uint32_t g_presentedFrames = 0;  // frames fully pushed to LCD
 volatile uint32_t g_abortedFrames   = 0;  // partial frames dropped (UDP reorder)
 
@@ -399,6 +401,8 @@ static void decodeTask(void*) {
     bool     streamStarted = false;
     uint32_t decodeAcc     = 0;
     uint32_t decodeCount   = 0;
+    uint32_t huffAcc       = 0;
+    uint32_t idctAcc       = 0;
 
     uint8_t  pendingFrame = 0xFF;
     uint8_t  readyMask    = 0;
@@ -426,21 +430,26 @@ static void decodeTask(void*) {
             frameStartMs = millis();
         }
 
-        uint32_t decUs = 0;
-        bool ok = decodeSlot(msg, decUs);
+        uint32_t decUs = 0, huffUs = 0, idctUs = 0;
+        bool ok = decodeSlot(msg, decUs, huffUs, idctUs);
 
         xSemaphoreGive(slotFree[msg.slotIdx]);
 
         if (ok) {
             tiles[msg.tId].stat_decoded++;
             decodeAcc   += decUs;
+            huffAcc     += huffUs;
+            idctAcc     += idctUs;
             decodeCount++;
 
             readyMask |= (uint8_t)(1u << msg.tId);
 
             if (decodeCount >= 16) {
                 g_avgDecodeUs = decodeAcc / decodeCount;
+                g_avgHuffUs   = huffAcc / decodeCount;
+                g_avgIdctUs   = idctAcc / decodeCount;
                 decodeAcc = 0; decodeCount = 0;
+                huffAcc = 0; idctAcc = 0;
             }
 
             if (!streamStarted) {

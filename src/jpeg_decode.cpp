@@ -35,8 +35,10 @@ void initJpegDecoder() {
     // Currently no decoder-specific init required.
 }
 
-bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
+bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs, uint32_t& huffUs, uint32_t& idctUs) {
     PipeSlot& s = slot[msg.slotIdx];
+    huffUs = 0;
+    idctUs = 0;
 
     if ((uintptr_t)s.assembly & 15) {
         decodeUs = 0;
@@ -64,6 +66,11 @@ bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     jpeg_dec.setPixelType(RGB565_BIG_ENDIAN);
     jpeg_dec.setUserPointer(&mcuCtx);
 
+#if JPEG_PROFILE
+    g_jpegHuffCycles = 0;
+    g_jpegIdctCycles = 0;
+#endif
+
     uint32_t t0 = micros();
     int rc = jpeg_dec.decode(0, 0, 0);
     jpeg_dec.close();
@@ -74,5 +81,11 @@ bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs) {
     }
 
     decodeUs = micros() - t0;
+#if JPEG_PROFILE
+    // 240MHz core clock -> cycles/240 = us. Cheap enough to do every tile;
+    // this whole block compiles to nothing when JPEG_PROFILE is 0.
+    huffUs = g_jpegHuffCycles / 240;
+    idctUs = g_jpegIdctCycles / 240;
+#endif
     return true;
 }

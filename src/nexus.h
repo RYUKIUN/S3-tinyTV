@@ -102,7 +102,7 @@
 // efficient. Flipping this to 1 is the ONLY change needed once it's fixed.
 #define TOUCH_USE_IRQ   0
 #define TOUCH_PIN_MISO  11          // shared-bus MISO (display doesn't use it)
-#define TOUCH_SPI_HZ    1000000     // XPT2046 max is ~2 MHz; 1 MHz is the safe default
+#define TOUCH_SPI_HZ    2000000     // XPT2046 max is ~2 MHz; 1 MHz is the safe default
 
 // BOOT button (GPIO0 on every ESP32-S3 devkit). Double-press it before the
 // stream starts to force a touch recalibration — see touch.cpp.
@@ -126,6 +126,7 @@ static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
 static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 
 // ── Network chunking ──────────────────────────────────────────────────────
+#define debugStatIntervalMs 200             // how often to send stats to the PC when debugEnabled
 #define CHUNK_DATA_SIZE  1400              // bytes of JPEG payload per UDP packet
 #define MAX_TILE_CHUNKS  24                // hard cap on chunks per tile
 #define MAX_TILE_JPEG    (MAX_TILE_CHUNKS * CHUNK_DATA_SIZE)  // = 33,600 B/tile ceiling
@@ -272,6 +273,8 @@ extern TileState tiles[NUM_TILES];
 
 // ── Cross-core stats ──────────────────────────────────────────────────────────
 extern volatile uint32_t g_avgDecodeUs;
+extern volatile uint32_t g_avgHuffUs;         // Huffman-decode share of g_avgDecodeUs (JPEG_PROFILE only, else 0)
+extern volatile uint32_t g_avgIdctUs;         // IDCT share of g_avgDecodeUs (JPEG_PROFILE only, else 0)
 extern volatile uint32_t g_presentedFrames;
 extern volatile uint32_t g_abortedFrames;
 
@@ -332,3 +335,5 @@ extern volatile bool     g_touchCalibrated;
 
 // ── Display double-buffer write index (Core-1 exclusive) ─────────────────────
 extern uint8_t writeSet;
+
+

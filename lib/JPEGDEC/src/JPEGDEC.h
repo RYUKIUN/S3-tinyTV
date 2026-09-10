@@ -43,6 +43,25 @@
 #define HAS_NEON
 #define ALLOWS_UNALIGNED
 #endif // __aarch64
+
+// Stage-level decode profiling (Huffman entropy decode vs IDCT), gated
+// behind a build flag so it costs nothing when off. Enable with
+// -DJPEG_PROFILE=1 (see platformio.ini). Accumulators are cycle counts
+// (xthal_get_ccount(), 240MHz on the S3); jpeg_decode.cpp converts to us
+// and resets them once per tile so decodeSlot can report a per-tile split.
+#ifndef JPEG_PROFILE
+#define JPEG_PROFILE 0
+#endif
+#if JPEG_PROFILE
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern volatile uint32_t g_jpegHuffCycles;
+extern volatile uint32_t g_jpegIdctCycles;
+#ifdef __cplusplus
+}
+#endif
+#endif // JPEG_PROFILE
 //
 // JPEG Decoder
 // Written by Larry Bank

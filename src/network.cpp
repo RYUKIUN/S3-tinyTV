@@ -1,6 +1,7 @@
 #include "network.h"
 #include "display.h"
 #include <WiFi.h>
+#include <nexus.h>
 
 static IRAM_ATTR void resetTile(uint8_t t) {
     memset(tiles[t].chunkGot, 0, sizeof(tiles[t].chunkGot));
@@ -182,7 +183,7 @@ void networkTask(void*) {
             resetTile(tId);
         }
 
-        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 400) {
+        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > debugStatIntervalMs) {
             uint32_t el = millis() - lastStatMs;
 
             static uint32_t lastPresented = 0;
@@ -227,13 +228,14 @@ void networkTask(void*) {
 
             snprintf(debugBuf, sizeof(debugBuf),
                 "%c%cFPS:%.1f|TEMP:%.1f|JIT:%.1f|DEC:%lu|DROP:%lu|ABRT:%lu"
-                "|SRAM:%lu/%lu|PSRAM:%lu/%lu|CPU0:%lu|CPU1:%lu",
+                "|SRAM:%lu/%lu|PSRAM:%lu/%lu|CPU0:%lu|CPU1:%lu|HUF:%lu|IDC:%lu",
                 0xAB, 0xCD,
                 fps, tempC, stat_jitter,
                 decUs, totalDrop, aborted,
                 freeSRAM / 1024, totalSRAM / 1024,
                 freePSR  / 1024, totalPSR  / 1024,
-                cpu0, cpu1);
+                cpu0, cpu1,
+                (unsigned long)g_avgHuffUs, (unsigned long)g_avgIdctUs);
 
             sendto(g_sock, debugBuf, strlen(debugBuf), 0,
                    (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
