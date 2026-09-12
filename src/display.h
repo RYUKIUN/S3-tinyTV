@@ -9,7 +9,9 @@
 class LGFX : public lgfx::LGFX_Device {
     lgfx::Bus_SPI          _bus;
     lgfx::Panel_ILI9341    _panel;
+#if TOUCH_FEATURE_ENABLED
     lgfx::Touch_XPT2046    _touch;
+#endif
 public:
     LGFX() {
         {
@@ -30,7 +32,7 @@ public:
             // during initTouch() — skips it entirely and cannot retrofit MISO
             // into the IDF bus configuration. Declaring it here means the one
             // spi_bus_initialize() that does run already has it.
-            cfg.pin_miso = TOUCH_PIN_MISO;
+            cfg.pin_miso = TOUCH_FEATURE_ENABLED ? TOUCH_PIN_MISO : -1;
             cfg.pin_dc   = LCD_PIN_DC;
 
             cfg.spi_3wire  = false;  // 4-wire SPI (MOSI + DC line)
@@ -39,6 +41,7 @@ public:
             _bus.config(cfg);
             _panel.setBus(&_bus);
         }
+    #if TOUCH_FEATURE_ENABLED
         {
             auto cfg = _panel.config();
 
@@ -99,6 +102,7 @@ public:
             _touch.config(cfg);
             _panel.setTouch(&_touch);
         }
+#endif
         setPanel(&_panel);
     }
 };

@@ -199,7 +199,9 @@ void setup() {
     // task exists and while nothing else can want the bus. It runs BEFORE
     // drawBootHeader() because calibration owns the whole screen and would
     // otherwise wipe a header we'd just drawn.
+#if TOUCH_FEATURE_ENABLED
     touchBegin();
+#endif
 
     drawBootHeader();
     statusLine(0, "Display:", g_touchCalibrated ? "OK + Touch" : "OK (no touch cal)",
@@ -353,6 +355,7 @@ void setup() {
     xTaskCreatePinnedToCore(wifiWatchdogTask,"WifiWatchdog", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 2, NULL, 0);
 
+#if TOUCH_FEATURE_ENABLED
     // Touch sampler: Core 0, priority 1 - strictly below displayTask (2) and
     // networkTask (3), exactly as the integration plan in HARDWARE.md called
     // for. It spends essentially all of its life blocked on the PENIRQ
@@ -364,6 +367,7 @@ void setup() {
     // printf). Only the rare path is heavy, and a stack overflow there would be
     // a crash rather than a glitch.
     xTaskCreatePinnedToCore(touchTask,       "TouchTask",    6144, NULL, 1, NULL, 0);
+#endif
 
     // ── Decode task (was Arduino loop()) ──────────────────────────────────────
     // Same 8 KB the Arduino loop task used to run on, same core (Core 1),
