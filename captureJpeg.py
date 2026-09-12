@@ -17,12 +17,27 @@ from queue import Queue
 PORT         = 12345
 ESP_W, ESP_H = 320, 240
 
-# Target per-frame byte budget the Auto-mode quality controller aims to
-# stay under (4:2:0 chroma only — that's the only mode this sends now).
-MAGIC_BYTES = 12000
+# Priority presets: one trackbar step picks BOTH the per-frame byte budget
+# the controller targets (4:2:0 chroma only — that's the only mode this
+# sends now) AND the quality ceiling it's allowed to climb back up to.
+# Index 0 = most FPS-protective, last index = most quality-protective.
+# (label, magic_bytes_threshold, auto_max_quality)
+PRIORITY_PRESETS = [
+    ("MAX FPS",      8000, 45),
+    ("FAST",        10500, 60),
+    ("BALANCED",    13000, 70),
+    ("QUALITY",      16500, 80),
+    ("MAX QUALITY", 20000, 90),
+]
+PRIORITY_DEFAULT_IDX = 2  # BALANCED
 
 # EMA Settings (Low-pass filter for bitrate)
 EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแต่ตอบสนองช้าลง (แนะนำ 0.1 - 0.2)
+
+# After an overflow streak, how many consecutive under-threshold frames the
+# EMA must hold before quality is allowed to climb back up. Prevents
+# climbing right back into the same complex scene on one calmer frame.
+COOLDOWN_FRAMES = 5
 
 CHUNK_DATA_SIZE  = 1400
 NUM_TILES        = 4
@@ -38,11 +53,6 @@ PREVIEW_W, PREVIEW_H = 480, 360
 # Send rate is fixed — not user-adjustable — so the pipeline behaves the
 # same way every time instead of being a variable someone has to tune.
 BASE_FPS = 35
-
-# Auto mode: the quality controller is free to climb as high as this.
-AUTO_MAX_QUALITY = 80
-# Manual mode: starting point for the quality slider.
-MANUAL_QUALITY_DEFAULT = 70
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
@@ -64,7 +74,7 @@ UNIX_NICE_LEVEL      = -10
 
 # Settings dir: one JSON file per ESP IP so multiple instances don't collide
 SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings")
-SETTINGS_KEYS = ("Mode (0=Auto 1=Manual)", "Manual Quality", "Sharpen", "Show Stats", "Enable Touch")
+SETTINGS_KEYS = ("Priority", "Sharpen", "Show Stats", "Enable Touch")
 
 # Rediscovery: how often the main process re-checks for new ESPs after the
 # first one has already been picked up (seconds).
@@ -764,19 +774,20 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     # Five controls, each self-explanatory from its own label (OpenCV's
     # trackbar UI has no separate space for tooltips, so the name itself
     # has to carry the explanation):
-    #   Mode           — 0 = Auto (quality manages itself), 1 = Manual (you set it)
-    #   Manual Quality — only takes effect when Mode = Manual
-    #   Sharpen        — 0 = off, higher = crisper edges
-    #   Show Stats     — 0 = clean preview, 1 = performance overlay on top
-    #   Enable Touch   — 0 = ESP touchscreen ignored, 1 = it drives this mouse
-    #   Monitor        — which screen to capture
+    #   Priority     — which PRIORITY_PRESETS step the byte-budget
+    #                  controller targets; 0 = protect FPS hardest,
+    #                  max = protect quality hardest. The controller
+    #                  always runs — this only moves its goalposts.
+    #   Sharpen      — 0 = off, higher = crisper edges
+    #   Show Stats   — 0 = clean preview, 1 = performance overlay on top
+    #   Enable Touch — 0 = ESP touchscreen ignored, 1 = it drives this mouse
+    #   Monitor      — which screen to capture
     _tb_cfg = {
-        "Mode (0=Auto 1=Manual)": (0, 1),
-        "Manual Quality":         (MANUAL_QUALITY_DEFAULT, 95),
-        "Sharpen":                (10, 20),
-        "Show Stats":             (1, 1),
-        "Enable Touch":           (1, 1),
-        "Monitor":                (monitor_idx, max_monitor_idx),
+        "Priority":     (PRIORITY_DEFAULT_IDX, len(PRIORITY_PRESETS) - 1),
+        "Sharpen":      (10, 20),
+        "Show Stats":   (1, 1),
+        "Enable Touch": (1, 1),
+        "Monitor":      (monitor_idx, max_monitor_idx),
     }
 
     saved_data = {}
@@ -803,19 +814,24 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     latest_esp_stats, last_debug_send, last_frame_bytes = {}, 0, 0
     touch = TouchInjector()
     last_touch_send = 0
-    current_qual = saved_data.get("Manual Quality", MANUAL_QUALITY_DEFAULT)
+    _init_preset_idx = saved_data.get("Priority", PRIORITY_DEFAULT_IDX)
+    if not (0 <= _init_preset_idx < len(PRIORITY_PRESETS)):
+        _init_preset_idx = PRIORITY_DEFAULT_IDX
+    current_qual = PRIORITY_PRESETS[_init_preset_idx][2]
     current_monitor_idx = monitor_idx
 
     # EMA Accumulator
     ema_avg_bytes = None
+    # Streak tracking for escalating drop / cooldown before climb-back
+    consecutive_overflows = 0
+    under_threshold_streak = 0
 
     try:
         while True:
             if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1: break
             t_start = time.perf_counter()
 
-            mode           = cv2.getTrackbarPos("Mode (0=Auto 1=Manual)", window_name)
-            manual_quality = cv2.getTrackbarPos("Manual Quality", window_name)
+            priority_idx   = cv2.getTrackbarPos("Priority", window_name)
             sharpen_steps  = cv2.getTrackbarPos("Sharpen", window_name)
             debug_state    = cv2.getTrackbarPos("Show Stats", window_name)
             touch_state    = cv2.getTrackbarPos("Enable Touch", window_name)
@@ -838,15 +854,16 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                     # invalid index chosen, snap trackbar back
                     cv2.setTrackbarPos("Monitor", window_name, current_monitor_idx)
 
-            sub_flag, sub_str, magic_threshold = JPEG_SUB_FLAG, JPEG_SUB_STR, MAGIC_BYTES
+            sub_flag, sub_str = JPEG_SUB_FLAG, JPEG_SUB_STR
+            priority_idx = max(0, min(len(PRIORITY_PRESETS) - 1, priority_idx))
+            priority_label, magic_threshold, quality_ceiling = PRIORITY_PRESETS[priority_idx]
 
-            if mode == 1:
-                # Manual — quality is exactly what the slider says, every frame.
-                current_qual = manual_quality
-            elif current_qual > AUTO_MAX_QUALITY:
-                # Auto — enforce the ceiling (matters right after switching
-                # from Manual, where current_qual may be above it).
-                current_qual = AUTO_MAX_QUALITY
+            if current_qual > quality_ceiling:
+                # Enforce the ceiling immediately — matters right after the
+                # user drags to a lower/FPS-favoring preset, so the change
+                # takes effect on the very next frame instead of drifting
+                # down one step at a time via the controller below.
+                current_qual = quality_ceiling
 
             try:
                 while True:
@@ -928,29 +945,52 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                                            send_buf, send_view, frame_id_box)
 
             # ─────────────────────────────────────────────
-            #  AUTO QUALITY LOGIC (EMA SMOOTHED) — Auto mode only.
-            #  In Manual mode the slider already set current_qual above;
-            #  we still keep the EMA fresh so switching back to Auto doesn't
-            #  start from stale data.
+            #  AUTO QUALITY LOGIC (EMA SMOOTHED, ESCALATING) — always runs.
+            #  The Priority preset only changes magic_threshold /
+            #  quality_ceiling above; this loop always closes the
+            #  byte-budget control loop against whichever preset is active.
             # ─────────────────────────────────────────────
             if ema_avg_bytes is None:
                 ema_avg_bytes = last_frame_bytes
             else:
                 ema_avg_bytes = (EMA_ALPHA * last_frame_bytes) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
 
-            if mode == 0:
-                lower_bound = magic_threshold * 0.90
+            lower_bound = magic_threshold * 0.90
 
-                if last_frame_bytes > magic_threshold:
-                    # Hard/instant drop: THIS frame actually blew the threshold —
-                    # react now on the raw size, don't wait for the EMA to catch
-                    # up (by the time it does, the ESP has already stalled on it
-                    # and the backlog bleeds into the following frames too).
-                    current_qual = max(5, current_qual - 6)
-                elif ema_avg_bytes < lower_bound:
-                    # Gentle climb back up once comfortably under threshold,
-                    # smoothed via EMA so quality doesn't flicker up and down.
-                    current_qual = min(AUTO_MAX_QUALITY, current_qual + 1)
+            if last_frame_bytes > magic_threshold:
+                # Hard/instant drop: THIS frame actually blew the threshold —
+                # react now on the raw size, don't wait for the EMA to catch
+                # up (by the time it does, the ESP has already stalled on it
+                # and the backlog bleeds into the following frames too).
+                #
+                # The correction ESCALATES with how many frames in a row
+                # have overflowed. A lone spike still gets the same gentle
+                # -6 as before; a sustained complex scene gets hit harder
+                # each additional frame instead of sawing down -6 at a time
+                # while the ESP backlog keeps building the whole time it
+                # takes to catch up.
+                consecutive_overflows += 1
+                drop = min(6 + (consecutive_overflows - 1) * 8, 40)
+                current_qual = max(5, current_qual - drop)
+                under_threshold_streak = 0
+            else:
+                consecutive_overflows = 0
+                # Cooldown (only matters once quality has actually been
+                # pushed down by a streak): require the EMA to stay under
+                # lower_bound for several consecutive frames running before
+                # climbing back, instead of climbing the instant a single
+                # calmer frame drops the EMA below the line. Without this,
+                # quality can climb right back into the same complex region
+                # a moment later and oscillate.
+                if ema_avg_bytes < lower_bound:
+                    under_threshold_streak += 1
+                    if under_threshold_streak >= COOLDOWN_FRAMES:
+                        # Gentle climb back up once comfortably under
+                        # threshold for a while, smoothed via EMA so
+                        # quality doesn't flicker up and down.
+                        current_qual = min(quality_ceiling, current_qual + 1)
+                else:
+                    under_threshold_streak = 0
             # ─────────────────────────────────────────────
 
             # UI rendering
@@ -1006,8 +1046,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                      _pct_ratio(str(int(ema_avg_bytes)), 0, magic_threshold)),
                     ("QUALITY", f"{current_qual}",                               (255, 255, 255),
                      _pct_ratio(str(current_qual), 0, 95)),
-                    ("MODE",    "MANUAL" if mode == 1 else "AUTO",
-                     UI_ACCENT if mode == 1 else UI_OK, None),
+                    ("PRIORITY", priority_label,
+                     UI_ACCENT, None),
                 ]
 
                 for i, (label, value, col, ratio) in enumerate(metrics):

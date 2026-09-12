@@ -126,7 +126,7 @@ static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
 static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 
 // ── Network chunking ──────────────────────────────────────────────────────
-#define debugStatIntervalMs 200             // how often to send stats to the PC when debugEnabled
+#define debugStatIntervalMs 300             // how often to send stats to the PC when debugEnabled
 #define CHUNK_DATA_SIZE  1400              // bytes of JPEG payload per UDP packet
 #define MAX_TILE_CHUNKS  24                // hard cap on chunks per tile
 #define MAX_TILE_JPEG    (MAX_TILE_CHUNKS * CHUNK_DATA_SIZE)  // = 33,600 B/tile ceiling
