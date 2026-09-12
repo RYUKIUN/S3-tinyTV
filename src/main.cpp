@@ -307,7 +307,7 @@ void setup() {
     statusLine(3, "WiFi:", "Connecting...", TFT_YELLOW);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    esp_wifi_set_max_tx_power(80);   // units are 0.25 dBm steps → requests 20 dBm;
+    esp_wifi_set_max_tx_power(20);   // units are 0.25 dBm steps → requests 20 dBm;
                                       // actual radiated power may be clamped lower
                                       // by regional regulatory limits
     WiFi.begin(WIFI_SSID, WIFI_PASS);

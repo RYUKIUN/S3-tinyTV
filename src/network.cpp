@@ -1,6 +1,7 @@
 #include "network.h"
 #include "display.h"
 #include <WiFi.h>
+#include <nexus.h>
 
 static IRAM_ATTR void resetTile(uint8_t t) {
     memset(tiles[t].chunkGot, 0, sizeof(tiles[t].chunkGot));
@@ -182,7 +183,7 @@ void networkTask(void*) {
             resetTile(tId);
         }
 
-        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > 400) {
+        if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > DEBUGINTERVAL) {
             uint32_t el = millis() - lastStatMs;
 
             static uint32_t lastPresented = 0;
