@@ -2,15 +2,9 @@
 
 **A wireless, real-time video display built from scratch on an ESP32-S3 — no capture card, no HDMI, just WiFi, a $10 SPI TFT, and a hand-tuned dual-core decode pipeline pushing full-motion video at up to 35 FPS.**
 
-<!--
-  DROP YOUR MEDIA HERE — this is the first thing anyone sees.
-  A short GIF or MP4 of the panel actually playing something (a game clip,
-  a music video, whatever) sells this project in 3 seconds better than any
-  paragraph below can. Recommended: a screen recording of the panel next to
-  the source video playing on your PC, so people can see it's live.
+<img width="4096" height="3072" alt="1000256331" src="https://github.com/user-attachments/assets/5bc51768-266e-4d6c-bbca-a3dcc689127c" />
+<img width="4096" height="3072" alt="1000256328" src="https://github.com/user-attachments/assets/764c2312-8662-49d3-a616-bdc128726e68" />
 
-  ![S3 Next-Gen JPEG Stream demo](docs/demo.gif)
--->
 
 ![status](https://img.shields.io/badge/status-active-brightgreen)
 ![platform](https://img.shields.io/badge/platform-ESP32--S3-blue)
