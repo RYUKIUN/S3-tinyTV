@@ -9,6 +9,7 @@ import ctypes
 import threading
 import json
 import multiprocessing as mp
+import subprocess
 from queue import Queue
 
 # ─────────────────────────────────────────────
@@ -16,6 +17,8 @@ from queue import Queue
 # ─────────────────────────────────────────────
 PORT         = 12345
 ESP_W, ESP_H = 320, 240
+WIFI_SSID = "Endmin"
+WIFI_PASS = "987654321"
 
 # Priority presets: one trackbar step picks BOTH the per-frame byte budget
 # the controller targets (4:2:0 chroma only — that's the only mode this
@@ -72,8 +75,8 @@ ESP_BEACON_TIMEOUT_S = 150.0
 SEND_RETRY_SLEEP_S   = 0.0005
 UNIX_NICE_LEVEL      = -10
 
-# Settings dir: one JSON file per ESP IP so multiple instances don't collide
-SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings")
+# All instances share one settings file beside this script; the latest save wins.
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 SETTINGS_KEYS = ("Priority", "Sharpen", "Show Stats", "Enable Touch")
 
 # Rediscovery: how often the main process re-checks for new ESPs after the
@@ -108,6 +111,52 @@ def get_mouse_pos():
         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
         return pt.x, pt.y
     return 0, 0
+
+
+def ensure_wifi_hotspot():
+    """Support the original working flow: the user starts the hotspot manually.
+
+    Windows' "Mobile hotspot" / "Hosted Network" feature is not the same as the
+    low-level netsh hostednetwork API. Many laptops explicitly report that the
+    hostednetwork API is unsupported even though the user can still create a
+    hotspot manually in Settings. For this project, the reliable behavior is to
+    leave hotspot creation to the user and simply proceed when the network is up.
+    """
+    if os.name != 'nt':
+        return True
+
+    try:
+        driver_info = subprocess.run(
+            ["netsh", "wlan", "show", "drivers"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        driver_out = (driver_info.stdout or "") + (driver_info.stderr or "")
+        if "Hosted network supported  : No" in driver_out or "Hosted network supported : No" in driver_out:
+            print("[Hotspot] This adapter does not expose the netsh hostednetwork API.")
+            print(f"[Hotspot] Use Windows 'Mobile hotspot' manually, then connect to SSID '{WIFI_SSID}' with password '{WIFI_PASS}'.")
+            print("[Hotspot] Discovery will continue; the ESP joins the already-running hotspot.")
+            return True
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(
+            ["netsh", "wlan", "show", "hostednetwork"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if "Status: Started" in (out.stdout or ""):
+            print(f"[Hotspot] Already running: {WIFI_SSID}")
+            return True
+    except Exception:
+        pass
+
+    print(f"[Hotspot] Hotspot is expected to be started manually: {WIFI_SSID}")
+    print("[Hotspot] Please enable Windows Mobile hotspot and keep the SSID/password matching the ESP config.")
+    return True
 
 # ─────────────────────────────────────────────
 #  TOUCH → MOUSE INJECTION
@@ -747,8 +796,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     set_high_resolution_timer()
     set_dpi_aware()
 
-    os.makedirs(SETTINGS_DIR, exist_ok=True)
-    settings_file = os.path.join(SETTINGS_DIR, f"settings_{target_ip.replace('.', '_')}.json")
+    settings_file = SETTINGS_FILE
     window_name = f"{WINDOW_NAME_BASE} - {target_ip}"
 
     frame_queue = Queue(maxsize=1)
@@ -795,7 +843,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
         try:
             with open(settings_file, 'r') as f:
                 saved_data = json.load(f)
-        except: pass
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            print(f"[Settings] Could not load {settings_file}: {exc}")
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, UI_W, UI_H)
@@ -1082,10 +1131,19 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
         for k in SETTINGS_KEYS:
             val = cv2.getTrackbarPos(k, window_name)
             if val != -1: final_settings[k] = val
+        temp_settings_file = f"{settings_file}.{os.getpid()}.tmp"
         try:
-            with open(settings_file, 'w') as f:
+            with open(temp_settings_file, 'w') as f:
                 json.dump(final_settings, f, indent=4)
-        except: pass
+            os.replace(temp_settings_file, settings_file)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"[Settings] Could not save {settings_file}: {exc}")
+        finally:
+            if os.path.exists(temp_settings_file):
+                try:
+                    os.remove(temp_settings_file)
+                except OSError as exc:
+                    print(f"[Settings] Could not remove temporary settings file: {exc}")
 
         with instance_lock:
             if current_monitor_idx in claimed_monitors:
@@ -1102,6 +1160,9 @@ def discovery_main():
     set_high_priority()
     set_high_resolution_timer()
     set_dpi_aware()
+    # The original, working flow is: user turns on the Windows hotspot manually.
+    # We do not force the unsupported hostednetwork API here.
+    ensure_wifi_hotspot()
 
     manager = mp.Manager()
     claimed_monitors = manager.list()
