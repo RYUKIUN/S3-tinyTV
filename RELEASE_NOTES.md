@@ -1,3 +1,46 @@
+# v3.0.0
+
+This release adds the missing product-level documentation and feature explanation that were not captured in v2.0.0. The real user-facing story is now documented clearly: this is a wireless screen-mirroring and touch-enabled display system for ESP32-S3, not just a JPEG decode test bed or generic media player.
+
+## Highlights
+
+- **Full project positioning rewrite in the README.** The project now opens with a clear statement of what it does, what it is for, and how it differs from similar projects such as tinytron, vPlayer, esp32-tv, Nomad, and esp_video (tuupola).
+- **Explicit description of the real use case.** Documentation now explains that the project is for real-time PC-to-display mirroring and remote desktop-like interaction, especially on small TFT panels.
+- **Touchscreen support is now called out as a major feature.** The README documents the XPT2046 touchscreen behavior: tap to click, scroll gestures, hold-drag behavior, and the fact that the display can act as a mouse input device for the mirrored PC.
+- **Python sender UI is fully explained.** The README documents the live control window and explains each control in practical terms:
+  - `Priority` — choose the streaming balance between FPS and image quality
+  - `Sharpen` — sharpen live image edges or disable it
+  - `Show Stats` — toggle live diagnostics overlay
+  - `Enable Touch` — turn touchscreen input on or off
+  - `Monitor` — select which screen to capture if multiple displays exist
+- **Adaptive streaming is documented as a core feature.** The project now clearly explains the adaptive JPEG quality behavior, where the sender changes image quality based on throughput and decode headroom.
+- **OTA and diagnostics are now part of the product story.** The docs explicitly note the OTA update flow and live diagnostic overlay to make the project easier to operate and maintain.
+
+## Changed
+
+- README rewritten in English with a much stronger product pitch for first-time readers.
+- Added a clear “What it does” section near the top of the document.
+- Added a “Main features” section summarizing the core capabilities.
+- Added a “Why this is different from similar projects” comparison section.
+- Added a dedicated “Python UI controls and how to use them” guide.
+- Expanded the system overview to cover the live streaming pipeline and touch feedback loop.
+- Improved the project narrative so it reads as a real wireless display solution rather than a loose collection of embedded experiments.
+
+## Added / Documented but not previously emphasized in v2.0.0
+
+- Wireless screen mirroring from PC to ESP32-S3 display
+- Touch-enabled interaction for the mirrored PC
+- Live Python control UI for priority/quality/sharpening/touch/stats
+- Comparison against similar ESP32 display and media projects
+- Broader end-user value proposition and practical use cases
+- Clear explanation of the setup flow, display behavior, and expected operating model
+
+## Impact
+
+This release is mostly documentation and product communication, but it closes the gap between the code and the actual end-user story. It makes the project immediately understandable to new readers and explains the major features that were not meaningfully captured in v2.0.0, especially the touchscreen-driven control flow and Python UI settings.
+
+---
+
 # v2.0.0
 
 A major pass on both stability and approachability. The headline fix closes out a
