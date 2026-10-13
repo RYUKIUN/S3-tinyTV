@@ -1,6 +1,8 @@
 ﻿# S3 Next-Gen JPEG Stream
 
-This project is a real-time Wi‑Fi display system that mirrors a PC screen or video feed onto a small TFT panel driven by an ESP32-S3. It does not rely on a capture card, HDMI, or dedicated streaming hardware. It uses an ESP32-S3, a 320×240 SPI TFT, and a Wi‑Fi link to push live content from a computer display to a compact embedded screen.
+This project is a real-time Wi‑Fi display system that sends a separate PC UI or video source to a small TFT panel driven by an ESP32-S3. It does not rely on a capture card, HDMI, or dedicated streaming hardware. It uses an ESP32-S3, a 320×240 SPI TFT, and a Wi‑Fi link to push content from a dedicated virtual display or app window to a compact embedded screen.
+
+This project is meant to create a second virtual display on the PC, render a custom UI or app there, capture that virtual display, and transmit it to the ESP32.
 
 <img width="4096" height="3072" alt="S3 display" src="https://github.com/user-attachments/assets/5bc51768-266e-4d6c-bbca-a3dcc689127c" />
 <img width="4096" height="3072" alt="S3 touch display" src="https://github.com/user-attachments/assets/764c2312-8662-49d3-a616-bdc128726e68" />
@@ -23,6 +25,14 @@ In short, this project turns a PC into a video sender and an ESP32-S3 into a liv
 - Touch input on the display is sent back to the PC and translated into mouse actions.
 
 This is not just an "ESP32 video player." It is a remote display / screen mirroring system designed for low-latency, continuous real-time display and touch interaction on a small embedded panel.
+
+Important: this project is designed around a virtual display on the PC. The point is to create a second monitor, render the Python UI or any app/window onto it, and then capture that virtual display and stream it to the ESP32. This is why the project exists: it is meant to display a dedicated interface or custom control surface, not to mirror your main monitor.
+
+Quick VDD setup guide:
+1. Install a virtual display driver (VDD) on Windows from https://github.com/VirtualDrivers/Virtual-Display-Driver
+2. After installation, open Windows Display settings and enable the new virtual display; it should show up as an additional monitor.
+3. Start `python captureJpeg.py` and select that monitor in the sender UI. The capture code will then grab the virtual display and stream that display to ESP32.
+
 
 Typical use cases:
 - A wireless secondary display for a PC or console
