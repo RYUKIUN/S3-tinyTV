@@ -55,7 +55,7 @@ PREVIEW_W, PREVIEW_H = 480, 360
 
 # Send rate is fixed — not user-adjustable — so the pipeline behaves the
 # same way every time instead of being a variable someone has to tune.
-BASE_FPS = 35
+BASE_FPS = 42
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
@@ -77,7 +77,7 @@ UNIX_NICE_LEVEL      = -10
 
 # All instances share one settings file beside this script; the latest save wins.
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-SETTINGS_KEYS = ("Priority", "Sharpen", "Show Stats", "Enable Touch")
+SETTINGS_KEYS = ("Priority", "Sharpen", "Debug Mode", "Enable Touch")
 
 # Rediscovery: how often the main process re-checks for new ESPs after the
 # first one has already been picked up (seconds).
@@ -614,13 +614,21 @@ def _send_udp(sock: socket.socket, data, dest):
 
 def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
                quality: int, sub_flag: int, t_start: float, target_fps: int,
-               send_buf: bytearray, send_view: memoryview, frame_id_box: list) -> int:
+               send_buf: bytearray, send_view: memoryview, frame_id_box: list,
+               prev_send_end: list = None) -> dict:
     frame_id = frame_id_box[0] & 0xFF
     frame_id_box[0] = (frame_id_box[0] + 1) & 0xFF
     dest      = (target_ip, PORT)
     total_bytes = 0
 
+    # Network jitter from sender side: gap between consecutive send_tiles calls
+    now_call = time.perf_counter()
+    send_interval_s = 0.0
+    if prev_send_end is not None and prev_send_end[0] > 0:
+        send_interval_s = now_call - prev_send_end[0]
+
     # 1. Encode all tiles
+    encode_start = time.perf_counter()
     encoded_tiles = []
     for tId in range(NUM_TILES):
         x, y = TILE_X[tId], TILE_Y[tId]
@@ -629,6 +637,7 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
                                               int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
         encoded_tiles.append(enc)
         total_bytes += len(enc)
+    encode_time_s = time.perf_counter() - encode_start
 
     # 2. Calculate Pacing
     overhead_time = time.perf_counter() - t_start
@@ -637,6 +646,8 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
     auto_pacing_s = max(0.0, idle_time / NUM_TILES)
 
     # 3. Transmit
+    send_time_s = 0.0
+    paced_tiles = 0
     for tId, enc in enumerate(encoded_tiles):
         total_len = len(enc)
         if total_len > MAX_TILE_JPEG: continue
@@ -650,12 +661,26 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
             clen   = min(CHUNK_DATA_SIZE, total_len - offset)
             send_buf[0:8] = [0xAA, 0xBB, frame_id, tId, cId, num_chunks, size_hi, size_lo]
             send_buf[8:8+clen] = enc_view[offset:offset+clen]
+            send_start = time.perf_counter()
             _send_udp(sock, send_view[:8+clen], dest)
+            send_time_s += time.perf_counter() - send_start
 
         if auto_pacing_s > 0:
             time.sleep(auto_pacing_s)
+            paced_tiles += 1
 
-    return total_bytes
+    call_end = time.perf_counter()
+    if prev_send_end is not None:
+        prev_send_end[0] = call_end
+
+    return {
+        "bytes": total_bytes,
+        "encode_s": encode_time_s,
+        "send_s": send_time_s,
+        "auto_pacing_s": auto_pacing_s,
+        "paced_tiles": paced_tiles,
+        "send_interval_s": send_interval_s,
+    }
 
 # ─────────────────────────────────────────────
 #  THREADS & STATS
@@ -827,13 +852,13 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     #                  max = protect quality hardest. The controller
     #                  always runs — this only moves its goalposts.
     #   Sharpen      — 0 = off, higher = crisper edges
-    #   Show Stats   — 0 = clean preview, 1 = performance overlay on top
+    #   Debug Mode   — 0 = clean preview, 1 = ESP stats overlay, 2 = PC encoder stats overlay
     #   Enable Touch — 0 = ESP touchscreen ignored, 1 = it drives this mouse
     #   Monitor      — which screen to capture
     _tb_cfg = {
         "Priority":     (PRIORITY_DEFAULT_IDX, len(PRIORITY_PRESETS) - 1),
         "Sharpen":      (10, 20),
-        "Show Stats":   (1, 1),
+        "Debug Mode":   (1, 2),
         "Enable Touch": (1, 1),
         "Monitor":      (monitor_idx, max_monitor_idx),
     }
@@ -860,9 +885,14 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     threading.Thread(target=capture_worker, args=(monitor_idx_box, frame_queue, stop_event, mss_lock), daemon=True).start()
 
     m_left, m_top, m_w, m_h = monitor_info.get("left", 0), monitor_info.get("top", 0), monitor_info.get("width", ESP_W), monitor_info.get("height", ESP_H)
-    latest_esp_stats, last_debug_send, last_frame_bytes = {}, 0, 0
+    latest_esp_stats, last_debug_send, last_frame_bytes = {}, 0, {"bytes": 0, "encode_s": 0.0, "send_s": 0.0, "auto_pacing_s": 0.0, "paced_tiles": 0, "send_interval_s": 0.0}
     touch = TouchInjector()
     last_touch_send = 0
+    prev_send_end   = [0.0]
+    pc_fps_counter  = 0
+    pc_fps_last_ts  = time.perf_counter()
+    pc_fps_actual   = 0.0
+    ema_jitter_s    = None
     _init_preset_idx = saved_data.get("Priority", PRIORITY_DEFAULT_IDX)
     if not (0 <= _init_preset_idx < len(PRIORITY_PRESETS)):
         _init_preset_idx = PRIORITY_DEFAULT_IDX
@@ -882,7 +912,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
 
             priority_idx   = cv2.getTrackbarPos("Priority", window_name)
             sharpen_steps  = cv2.getTrackbarPos("Sharpen", window_name)
-            debug_state    = cv2.getTrackbarPos("Show Stats", window_name)
+            debug_state    = cv2.getTrackbarPos("Debug Mode", window_name)
             touch_state    = cv2.getTrackbarPos("Enable Touch", window_name)
             selected_display = cv2.getTrackbarPos("Monitor", window_name)
 
@@ -959,7 +989,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             touch.tick(m_left, m_top, m_w, m_h)
 
             if time.time() - last_debug_send > DEBUG_SEND_INTERVAL_S:
-                _send_udp(sock, bytes([0xAA, 0xCC, 0x01, debug_state]), (target_ip, PORT))
+                esp_debug_flag = 1 if debug_state == 1 else 0
+                _send_udp(sock, bytes([0xAA, 0xCC, 0x01, esp_debug_flag]), (target_ip, PORT))
                 last_debug_send = time.time()
 
             if frame_queue.empty(): continue
@@ -991,7 +1022,25 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 resized = cv2.addWeighted(resized, 1.0 + s, cv2.GaussianBlur(resized, (0,0), 0.3 + s*0.35), -s, 0)
 
             last_frame_bytes = send_tiles(sock, target_ip, resized, current_qual, sub_flag, t_start, BASE_FPS,
-                                           send_buf, send_view, frame_id_box)
+                                           send_buf, send_view, frame_id_box, prev_send_end)
+
+            # ── PC FPS measurement (1-second sliding window) ──
+            pc_fps_counter += 1
+            now_fps = time.perf_counter()
+            if now_fps - pc_fps_last_ts >= 1.0:
+                pc_fps_actual  = pc_fps_counter / (now_fps - pc_fps_last_ts)
+                pc_fps_counter = 0
+                pc_fps_last_ts = now_fps
+
+            # ── Sender-side jitter EMA ──
+            ji = last_frame_bytes.get("send_interval_s", 0.0)
+            if ji > 0:
+                if ema_jitter_s is None:
+                    ema_jitter_s = ji
+                else:
+                    ema_jitter_s = EMA_ALPHA * ji + (1.0 - EMA_ALPHA) * ema_jitter_s
+
+            frame_byte_count = last_frame_bytes["bytes"]
 
             # ─────────────────────────────────────────────
             #  AUTO QUALITY LOGIC (EMA SMOOTHED, ESCALATING) — always runs.
@@ -1000,13 +1049,13 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             #  byte-budget control loop against whichever preset is active.
             # ─────────────────────────────────────────────
             if ema_avg_bytes is None:
-                ema_avg_bytes = last_frame_bytes
+                ema_avg_bytes = frame_byte_count
             else:
-                ema_avg_bytes = (EMA_ALPHA * last_frame_bytes) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
+                ema_avg_bytes = (EMA_ALPHA * frame_byte_count) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
 
             lower_bound = magic_threshold * 0.90
 
-            if last_frame_bytes > magic_threshold:
+            if frame_byte_count > magic_threshold:
                 # Hard/instant drop: THIS frame actually blew the threshold —
                 # react now on the raw size, don't wait for the EMA to catch
                 # up (by the time it does, the ESP has already stalled on it
@@ -1052,7 +1101,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 overlay = np.empty_like(preview)
                 _draw_vertical_gradient(overlay, UI_BG_TOP, UI_BG_BOTTOM)
 
-                size_col = UI_ERR if last_frame_bytes > magic_threshold else UI_OK
+                size_col = UI_ERR if frame_byte_count > magic_threshold else UI_OK
                 sram_str  = latest_esp_stats.get('SRAM',  '?/?')
                 psram_str = latest_esp_stats.get('PSRAM', '?/?')
 
@@ -1089,8 +1138,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                      _pct_ratio(latest_esp_stats.get('CPU1', '0'), 0, 100)),
                     ("SRAM",  sram_str,                                          _mem_color(sram_str), None),
                     ("PSRAM", psram_str,                                        _mem_color(psram_str), None),
-                    ("RAW",   f"{last_frame_bytes}B",                            size_col,
-                     _pct_ratio(str(last_frame_bytes), 0, magic_threshold)),
+                    ("RAW",   f"{frame_byte_count}B",                            size_col,
+                     _pct_ratio(str(frame_byte_count), 0, magic_threshold)),
                     ("AVG",   f"{int(ema_avg_bytes)}B",                          UI_ACCENT,
                      _pct_ratio(str(int(ema_avg_bytes)), 0, magic_threshold)),
                     ("QUALITY", f"{current_qual}",                               (255, 255, 255),
@@ -1111,6 +1160,88 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
 
                 # Single blend: this is the only place DEBUG_OVERLAY_ALPHA is used,
                 # and now it governs the opacity of everything above at once.
+                preview = cv2.addWeighted(overlay, DEBUG_OVERLAY_ALPHA, preview, 1.0 - DEBUG_OVERLAY_ALPHA, 0)
+
+            elif debug_state == 2:
+                # ── Mode 2: PC-side encoder / pipeline debug overlay ──
+                # Same dark glass-card palette as Mode 1; ESP debug packets are
+                # suppressed (flag=0 above) because Mode 2 is PC-side only.
+                overlay = np.empty_like(preview)
+                _draw_vertical_gradient(overlay, UI_BG_TOP, UI_BG_BOTTOM)
+
+                # ── Header ──
+                header_h = 26
+                cv2.putText(overlay, "PC ENCODER DEBUG", (10, 18), UI_FONT, 0.5, UI_TITLE_COL, 1, cv2.LINE_AA)
+                disp_txt = f"Display {current_monitor_idx}"
+                dw, _, _ = _text_size(disp_txt, 0.42, 1)
+                cv2.putText(overlay, disp_txt, (PREVIEW_W - dw - 10, 18), UI_FONT, 0.42, UI_ACCENT, 1, cv2.LINE_AA)
+                cv2.line(overlay, (10, header_h), (PREVIEW_W - 10, header_h), UI_CARD_EDGE, 1, cv2.LINE_AA)
+
+                # ── Derived metrics ──
+                enc_us   = int(last_frame_bytes.get("encode_s", 0.0) * 1e6)
+                send_us  = int(last_frame_bytes.get("send_s",   0.0) * 1e6)
+                enc_ms   = enc_us  / 1000.0
+                send_ms  = send_us / 1000.0
+                frame_budget_s   = 1.0 / max(1, BASE_FPS)
+                elapsed_now      = time.perf_counter() - t_start
+                budget_pct       = min(999.0, (elapsed_now / frame_budget_s) * 100.0)
+                pacing_us        = int(last_frame_bytes.get("auto_pacing_s", 0.0) * 1e6)
+                jitter_dev_ms    = abs((ema_jitter_s or frame_budget_s) - frame_budget_s) * 1000.0
+                ovf_strk         = consecutive_overflows
+                cool_strk        = under_threshold_streak
+
+                enc_col  = UI_OK if enc_ms < 5 else (UI_WARN if enc_ms < 10 else UI_ERR)
+                send_col = UI_OK if send_ms < 3 else (UI_WARN if send_ms < 7 else UI_ERR)
+                bgt_col  = UI_OK if budget_pct < 70 else (UI_WARN if budget_pct < 90 else UI_ERR)
+                fps_col  = UI_OK if pc_fps_actual >= 30 else (UI_WARN if pc_fps_actual >= 25 else UI_ERR)
+                jit_col  = UI_OK if jitter_dev_ms < 2 else (UI_WARN if jitter_dev_ms < 5 else UI_ERR)
+                ovf_col  = UI_OK if ovf_strk == 0 else (UI_WARN if ovf_strk < 3 else UI_ERR)
+                cool_frac = cool_strk / max(1, COOLDOWN_FRAMES)
+                cool_col = UI_LABEL_COL if cool_frac == 0 else (UI_OK if cool_frac >= 1.0 else UI_WARN)
+                size_col2 = UI_ERR if frame_byte_count > magic_threshold else UI_OK
+
+                pc2_metrics = [
+                    ("ENC TIME",   f"{enc_us}us",                   enc_col,
+                     _pct_ratio(str(enc_ms), 0, 20)),
+                    ("SEND TIME",  f"{send_us}us",                  send_col,
+                     _pct_ratio(str(send_ms), 0, 15)),
+                    ("BUDGET %",   f"{budget_pct:.1f}%",            bgt_col,
+                     _pct_ratio(str(budget_pct), 0, 100)),
+                    ("PC FPS",     f"{pc_fps_actual:.1f}",          fps_col,
+                     _pct_ratio(str(pc_fps_actual), 15, 35)),
+                    ("PACING/T",   f"{pacing_us}us",                UI_ACCENT, None),
+                    ("JITTER",     f"{jitter_dev_ms:.2f}ms",        jit_col,
+                     _pct_ratio(str(jitter_dev_ms), 0, 10)),
+                    ("OVF STRK",   f"{ovf_strk}",                   ovf_col,
+                     _pct_ratio(str(ovf_strk), 0, 5)),
+                    ("COOLDOWN",   f"{cool_strk}/{COOLDOWN_FRAMES}",cool_col,
+                     cool_frac),
+                    ("RAW",        f"{frame_byte_count}B",          size_col2,
+                     _pct_ratio(str(frame_byte_count), 0, magic_threshold)),
+                    ("AVG EMA",    f"{int(ema_avg_bytes or 0)}B",   UI_ACCENT,
+                     _pct_ratio(str(int(ema_avg_bytes or 0)), 0, magic_threshold)),
+                    ("QUALITY",    f"{current_qual}",               (255, 255, 255),
+                     _pct_ratio(str(current_qual), 0, 95)),
+                    ("PRIORITY",   priority_label,                  UI_ACCENT, None),
+                    ("TARGET FPS", f"{BASE_FPS}",                   UI_LABEL_COL, None),
+                ]
+
+                cols, rows = 4, 4
+                margin, gap = 10, 6
+                grid_top    = header_h + 8
+                grid_bottom = PREVIEW_H - 16
+                cell_w = (PREVIEW_W - margin * 2 - gap * (cols - 1)) // cols
+                cell_h = (grid_bottom - grid_top - gap * (rows - 1)) // rows
+
+                for i, (label, value, col, ratio) in enumerate(pc2_metrics):
+                    r, c = divmod(i, cols)
+                    cx = margin + c * (cell_w + gap)
+                    cy = grid_top + r * (cell_h + gap)
+                    _draw_chip(overlay, cx, cy, cell_w, cell_h, label, value, col, ratio)
+
+                footer_txt = f"{sub_str} chroma  ·  PC encoder stats  ·  Q to quit"
+                cv2.putText(overlay, footer_txt, (10, PREVIEW_H - 4), UI_FONT, 0.34, UI_LABEL_COL, 1, cv2.LINE_AA)
+
                 preview = cv2.addWeighted(overlay, DEBUG_OVERLAY_ALPHA, preview, 1.0 - DEBUG_OVERLAY_ALPHA, 0)
 
             cv2.imshow(window_name, preview)
