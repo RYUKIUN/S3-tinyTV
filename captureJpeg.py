@@ -55,7 +55,7 @@ PREVIEW_W, PREVIEW_H = 480, 360
 
 # Send rate is fixed — not user-adjustable — so the pipeline behaves the
 # same way every time instead of being a variable someone has to tune.
-BASE_FPS = 42
+BASE_FPS = 45
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
@@ -1087,6 +1087,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                         # threshold for a while, smoothed via EMA so
                         # quality doesn't flicker up and down.
                         current_qual = min(quality_ceiling, current_qual + 1)
+                        if current_qual >= quality_ceiling:
+                            under_threshold_streak = 0  # stop counting once at ceiling
                 else:
                     under_threshold_streak = 0
             # ─────────────────────────────────────────────

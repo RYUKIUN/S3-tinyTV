@@ -1,0 +1,27 @@
+# Component manager manifest for the "main" component.
+#
+# idf.py resolves these automatically on the FIRST build (needs internet
+# access once, same as any fresh ESP-IDF/PlatformIO toolchain setup) and
+# caches them under managed_components/ — nothing to clone or install by
+# hand.
+#
+# The dependency KEY on the left (e.g. "lovyangfx") IS the component name
+# the component manager registers it under — that's what main/CMakeLists.txt
+# lists in REQUIRES. Don't rename one without the other.
+
+dependencies:
+  idf:
+    version: ">=5.1"
+
+  # JPEG decoder — swapped in to replace the old JPEGDEC fork. Pulled
+  # straight from Espressif's official component registry.
+  espressif/esp_new_jpeg: "^1.0.2"
+
+  # Display + touch driver. Not on the component registry, so it's pulled
+  # as a git dependency instead — same library, same API, just fetched
+  # straight from upstream instead of vendored into this zip.
+  # Pin bumped deliberately; upstream names this release tag "1.1.16"
+  # (without a leading "v"). Change this to an existing ref to upgrade.
+  lovyangfx:
+    git: https://github.com/lovyan03/LovyanGFX.git
+    version: 1.1.16

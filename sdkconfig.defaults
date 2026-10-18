@@ -1,0 +1,63 @@
+# sdkconfig.defaults — baked-in project defaults for the N16R8 board
+# (16 MB QIO flash + 8 MB Octal PSRAM). idf.py merges this into the real
+# `sdkconfig` on first configure; feel free to run `idf.py menuconfig` on
+# top of it later, menuconfig always wins over this file after that point.
+#
+# NOTE ON SYMBOL NAMES: Kconfig symbol names shift a little between IDF
+# 5.1 / 5.3 / 5.4+. If `idf.py build` warns "unknown kconfig symbol" for
+# any one line below, that's almost always a renamed/merged option on your
+# installed IDF version — open menuconfig, search (the "/" key) for the
+# setting by its description (e.g. search "Octal" for the PSRAM mode), and
+# fix just that one line. The rest of this file is unaffected.
+
+# ── Target ──────────────────────────────────────────────────────────────
+CONFIG_IDF_TARGET="esp32s3"
+
+# ── Flash: 16 MB, QIO, 80 MHz ──────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# ── Custom partition table (OTA-capable, see partitions_16MB_ota.csv) ──
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16MB_ota.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_16MB_ota.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# ── PSRAM: 8 MB Octal, mapped to the heap via MALLOC_CAP_SPIRAM ─────────
+# This block is the direct replacement for the old
+# `board_build.arduino.memory_type = qio_opi` line — without it PSRAM is
+# "found" but never mapped, and heap_caps_malloc(MALLOC_CAP_SPIRAM) fails.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+# Keep PSRAM explicit-opt-in only (heap_caps_malloc(MALLOC_CAP_SPIRAM)),
+# never a silent fallback for normal malloc() — matches the original
+# project's "SRAM is scarce, PSRAM is opt-in" design intentionally.
+# CONFIG_SPIRAM_USE_MALLOC is deliberately left unset.
+
+# ── CPU: 240 MHz ─────────────────────────────────────────────────────────
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# ── Console / log over UART0 (works on every S3 devkit's USB-UART bridge).
+# If your board only exposes the native USB-JTAG/CDC port, switch this to
+# CONFIG_ESP_CONSOLE_USB_CDC instead.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# ── FreeRTOS ────────────────────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+
+# ── WiFi ────────────────────────────────────────────────────────────────
+CONFIG_ESP_WIFI_SW_COEXIST_ENABLE=y
+
+# ── Compiler optimisation — matches the old `-O3 -ffast-math` build flags
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ── Task watchdog — displayTask registers itself; keep the default 5s
+# timeout generous since USB/JTAG debugging can otherwise trip it.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=5
