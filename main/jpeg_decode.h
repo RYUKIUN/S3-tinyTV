@@ -2,5 +2,6 @@
 
 #include "nexus.h"
 
-void initJpegDecoder();
-bool decodeSlot(const DecodeMsg& msg, uint32_t& decodeUs);
+bool initJpegDecoder();
+bool decodeJpegFrame(const DecodeMsg& msg, uint8_t framebufferIdx,
+                     uint32_t& decodeUs, uint32_t& copyUs);

@@ -1,8 +1,8 @@
 # S3 Next-Gen JPEG Stream — pure ESP-IDF build
 
-ESP32-S3 + ILI9341 wireless display stream. 320×240, tiled into 4 quadrants,
-JPEG over UDP, pushed to the panel via DMA. Touch (XPT2046) reports back to
-the PC as mouse events.
+ESP32-S3 + ILI9341 wireless display stream. 320×240 full-frame JPEG over
+chunked UDP, decoded in blocks and pushed to the panel via DMA. Touch
+(XPT2046) reports back to the PC as mouse events.
 
 This is a **rebase** of an earlier Arduino/PlatformIO version of the same
 project onto **pure ESP-IDF** (native `idf.py`/VS Code ESP-IDF extension —
@@ -99,21 +99,20 @@ the plain IP always works.)
      `main/CMakeLists.txt` + `sdkconfig.defaults`; `board_build.*` INI
      settings → Kconfig symbols in `sdkconfig.defaults`.
 
-2. **JPEG decoder: JPEGDEC fork → `esp_new_jpeg`.** Target config is the
-   component's own published benchmark — `JPEG_SUBSAMPLE_420`, quality 60,
-   `JPEG_PIXEL_FORMAT_RGB565_LE`, 66.28 fps @ 320×240 on an S3, one core;
-   our tiles are a quarter that size. See the comment block at the top of
-   `main/jpeg_decode.cpp` for the one real architectural difference this
-   swap caused (esp_new_jpeg decodes to one packed buffer rather than via
-   JPEGDEC's per-MCU write-into-framebuffer callback) and how the pipeline
-   absorbs it without adding an extra copy pass.
+2. **JPEG decoder: `esp_new_jpeg`, full-frame block mode.** The PC sends one
+   JPEG per captured frame, capped at 30 KiB and sent with 1 ms gaps between
+   chunks to reduce UDP bursts. The ESP assembles it in a PSRAM ring slot,
+   then decodes 8/16-row blocks into a small aligned internal-RAM
+   scratch buffer and copies each block directly into a free PSRAM framebuffer.
 
-3. **Everything else is untouched.** The UDP tile-chunking protocol, the
-   4-slot decode pipeline, the ping-pong framebuffer/fallback-to-last-
-   frame logic in `decodeTask()`, the touch calibration math, the SPI bus
-   arbitration between display DMA and touch reads — none of that
-   changed. `captureJpeg.py` (the PC side) needs no changes at all; the
-   wire protocol is identical.
+3. **Explicit buffer ownership.** Separate free queues manage JPEG slots and
+   display framebuffers. A framebuffer remains owned by the display task
+   until its asynchronous DMA transfer completes; there is no full-frame
+   framebuffer copy or partial-tile ready-mask fallback.
+
+4. **Wire format changed.** The 8-byte UDP header now carries frame ID,
+   chunk index/count, flags, and total JPEG length. Restart both the PC sender
+   and ESP firmware together; old tile-protocol senders are incompatible.
 
 ## If your board isn't N16R8
 

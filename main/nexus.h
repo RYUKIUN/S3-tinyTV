@@ -127,35 +127,24 @@
 // ── Display geometry (logical, post-rotation) ────────────────────────────
 #define SCREEN_W         320
 #define SCREEN_H         240
-#define NUM_TILES        4
-#define TILE_W           160
-#define TILE_H           120
-#define TILE_PIXELS      (TILE_W * TILE_H)
-
-static const int16_t TILE_X[NUM_TILES] = {  0, 160,   0, 160 };
-static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 
 // ── Network chunking ──────────────────────────────────────────────────────
 #define DEBUGINTERVAL 300                   // ms between debug stats packets
 #define CHUNK_DATA_SIZE  1400              // bytes of JPEG payload per UDP packet
-#define MAX_TILE_CHUNKS  24                // hard cap on chunks per tile
-#define MAX_TILE_JPEG    (MAX_TILE_CHUNKS * CHUNK_DATA_SIZE)  // = 33,600 B/tile ceiling
+#define MAX_JPEG_FRAME   (30 * 1024)       // conservative per-frame JPEG cap: 30 KiB
+#define MAX_FRAME_CHUNKS ((MAX_JPEG_FRAME + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE)
 
 // ── Pipeline depth (memory budget) ────────────────────────────────────────
-// CFG_NUM_JPEG_SLOTS lives in SRAM (decoder reads it, needs to be fast) —
-// SRAM is the scarce resource here, don't raise this casually.
-// CFG_NUM_DISPLAY_BUFS lives in PSRAM (8 MB, much more headroom) — safe to
-// raise a buffer or two if you want more slack absorbing display jitter.
-#define CFG_NUM_JPEG_SLOTS    3   // desired JPEG slots  (1–6)
+// JPEG frame buffers and display framebuffers both live in PSRAM.
+// The decoder's small block scratch buffer stays in internal SRAM.
+// More JPEG slots absorb network/decode jitter at a cost of up to 30 KiB each.
+#define CFG_NUM_JPEG_SLOTS    3   // desired full-frame JPEG buffers (1–6)
 #define CFG_NUM_DISPLAY_BUFS  3   // desired display bufs (2–6)
 
 // Hard array caps — do NOT exceed. These size the actual arrays; the
 // CFG_ values above are the *desired* runtime count within that cap.
 #define MM_MAX_JPEG_SLOTS     6
 #define MM_MAX_DISPLAY_BUFS   6
-
-// Backward-compat alias (used by legacy code paths that don't need the runtime val)
-#define NUM_SLOTS MM_MAX_JPEG_SLOTS
 
 const int UDP_PORT = 12345;
 
@@ -165,7 +154,7 @@ const int UDP_PORT = 12345;
 // ═══════════════════════════════════════════════════════════════════════════
 #define PKT_TIMEOUT_MS           3000
 #define OVERLAY_FLASH_MS         1000
-#define TILE_TIMEOUT_MS          200
+#define FRAME_ASSEMBLY_TIMEOUT_MS 80
 #define WIFI_CONNECT_TIMEOUT_MS  150000   // how long to wait for WiFi before restarting
 
 // ── Touch → PC mouse ──────────────────────────────────────────────────────
@@ -240,14 +229,22 @@ extern uint8_t g_numJpegSlots;    // actual slots allocated  (1–MM_MAX_JPEG_SL
 extern uint8_t g_numDisplayBufs;  // actual display bufs allocated (2–MM_MAX_DISPLAY_BUFS)
 
 // ── Pipeline structs ──────────────────────────────────────────────────────────
-struct PipeSlot {
-    uint8_t* assembly;
+struct JpegFrameSlot {
+    uint8_t* data = nullptr;
+    uint8_t frameId = 0xFF;
+    uint8_t totalChunks = 0;
+    uint8_t chunksReceived = 0;
+    uint16_t frameSize = 0;
+    uint32_t firstChunkMs = 0;
+    bool chunkReceived[MAX_FRAME_CHUNKS] = {};
+    bool receiving = false;
+    bool queued = false;
+    bool inUse = false;
 };
 
 struct DecodeMsg {
     uint8_t  frameId;
-    uint8_t  tId;
-    uint8_t  slotIdx;
+    uint8_t  jpegSlot;
     uint16_t len;
     uint32_t queuedAtUs;
 };
@@ -257,38 +254,24 @@ struct DisplayMsg {
     uint8_t bufSet;
 };
 
-struct TileState {
-    uint8_t* chunkBuf[MAX_TILE_CHUNKS];
-    uint16_t chunkLen[MAX_TILE_CHUNKS];
-    bool     chunkGot[MAX_TILE_CHUNKS];
-    uint8_t  frameId      = 0xFF;
-    uint8_t  totalChunks  = 0;
-    uint16_t frameSize    = 0;
-    uint8_t  chunksGot    = 0;
-    uint32_t firstChunkMs = 0;
-    uint32_t stat_decoded = 0;
-    uint32_t stat_corrupt = 0;
-    uint32_t stat_timeout = 0;
-};
-
 // ── FreeRTOS handles ──────────────────────────────────────────────────────────
+extern QueueHandle_t     jpegFreeQueue;
 extern QueueHandle_t     decodeQueue;
 extern QueueHandle_t     displayQueue;
-extern SemaphoreHandle_t slotFree[MM_MAX_JPEG_SLOTS];
+extern QueueHandle_t     framebufferFreeQueue;
 
 // ── Shared buffers ────────────────────────────────────────────────────────────
 extern uint16_t* frameFb[MM_MAX_DISPLAY_BUFS];   // only [0..g_numDisplayBufs-1] allocated
-extern uint8_t*  tileChunkStorage[NUM_TILES];
-extern PipeSlot  slot[MM_MAX_JPEG_SLOTS];         // only [0..g_numJpegSlots-1] allocated
-extern TileState tiles[NUM_TILES];
+extern JpegFrameSlot jpegFrames[MM_MAX_JPEG_SLOTS]; // only [0..g_numJpegSlots-1] allocated
 
 // ── Cross-core stats ──────────────────────────────────────────────────────────
 extern volatile uint32_t g_avgDecodeUs;
 extern volatile uint32_t g_presentedFrames;
 extern volatile uint32_t g_abortedFrames;
+extern volatile uint32_t g_networkDrops;
 
 // ── Streaming / WiFi state ────────────────────────────────────────────────────
-extern volatile bool     g_streaming;        // true once first tile decoded
+extern volatile bool     g_streaming;        // true once first full frame decoded
 extern volatile bool     g_wifiOk;           // mirrors the IP_EVENT_STA_GOT_IP / WIFI_EVENT_STA_DISCONNECTED state
 extern volatile uint32_t g_lastPktMs;        // updated by networkTask on each valid UDP packet
 extern volatile uint32_t g_wifiConnectedMs;  // millis() when WiFi first associated
@@ -343,6 +326,3 @@ extern QueueHandle_t     touchQueue;
 extern volatile bool     g_touchEnabled;   // set by the PC over the 0xAA 0xCC control channel
 extern volatile bool     g_touchCalibrated;
 #endif
-
-// ── Display double-buffer write index (Core-1 exclusive) ─────────────────────
-extern uint8_t writeSet;

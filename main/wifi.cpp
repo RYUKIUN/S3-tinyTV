@@ -66,7 +66,7 @@ void wifiInit() {
                                      // actual radiated power may be clamped
                                      // lower by regional regulatory limits
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
-    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW40);
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20));
 }
 
 void wifiReconnect() {

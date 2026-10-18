@@ -252,8 +252,8 @@ The PC can switch reporting off at the source via the existing control channel
 
 | Item | Value |
 |---|---|
-| Link | WiFi 802.11n, HT40 (40 MHz channel width), single spatial stream (no MIMO on S3) |
-| Transport | UDP, port 12345, tile-chunked JPEG frames from a PC sender (`captureJpeg.py`) |
+| Link | WiFi 802.11n, HT20 (20 MHz channel width), single spatial stream (no MIMO on S3) |
+| Transport | UDP, port 12345, full-frame JPEG split into indexed chunks, max 30 KiB (`captureJpeg.py`) |
 | TX power | `esp_wifi_set_max_tx_power(80)` (0.25 dBm units → 20 dBm requested; code comment says "~10 dBm — the community fix," this discrepancy hasn't been investigated) |
 | Real-world throughput ceiling | Not measured on this hardware — estimated conservatively at ~10-20 Mbit/s sustained given CPU contention from decode/display/network sharing both cores; idle-chip iperf-style benchmarks for ESP32-S3 in this config are typically cited around 30-40 Mbit/s, but that number assumes no other workload running |
 
@@ -261,18 +261,27 @@ The PC can switch reporting off at the source via the existing control channel
 
 | Core | Tasks |
 |---|---|
-| Core 0 | `networkTask` (priority 3), `displayTask` (priority 2), `otaTask` (priority 1), `wifiWatchdogTask` (priority 1), `touchTask` (priority 1) |
-| Core 1 | `decodeTask` (priority 2) — JPEG tile decode, formerly Arduino `loop()` |
+| Core 0 | `networkTask` (priority 3), `displayTask` (priority 3), OTA/web-server task, `wifiWatchdogTask` (priority 1), `touchTask` (priority 1) |
+| Core 1 | `decodeTask` (priority 2) — full-frame JPEG block decode |
 
 ## Memory Budget (approximate, at time of writing)
 
 | Buffer | Location | Size |
 |---|---|---|
-| JPEG assembly slots (`slot[].assembly`) | SRAM (`MALLOC_CAP_INTERNAL`) | 4 × 33.6 KB = 134.4 KB |
-| Display framebuffers (`frameFb[]`) | PSRAM | 3 × 150 KB = 450 KB (bumped from 2 to 3 buffers this session) |
-| Tile chunk staging (`tileChunkStorage[]`) | PSRAM | 4 × 33.6 KB = 134.4 KB |
-| Free SRAM headroom (approx, at last check) | — | ~72 KB |
+| Full-frame JPEG ring (`jpegFrames[].data`) | SRAM preferred, PSRAM fallback | First 2 slots prefer internal RAM (up to 60 KiB total); remaining slot uses PSRAM |
+| Decoder block scratch (`s_blockOut`) | Internal SRAM | 320 × 16 × 2 = 10 KiB, 16-byte aligned |
+| Display framebuffers (`frameFb[]`) | PSRAM | 3 × 320 × 240 × 2 = 450 KiB |
+| Chunk bitmap / per-slot metadata | Internal SRAM | 3 × up to 22 chunk flags plus slot state |
 
-Decoder reads raw JPEG bytes from SRAM specifically because it's on the
-decode hot path and needs to be fast — this is why the JPEG slot count
-can't easily grow without eating into that already-thin 72 KB margin.
+JPEG ring slots reserve up to 30 KiB each but only receive the bytes reported
+in each packet header. The first two slots try internal SRAM and fall back to
+PSRAM if allocation fails; the remaining slot uses PSRAM. UDP receive mailbox
+depth is configured to 32 packets, static WiFi RX buffers to 16, and the RX
+block-ack window to 16. These use additional RAM in exchange for more buffering.
+`CFG_NUM_JPEG_SLOTS` can be raised to absorb more network/decode jitter, at a
+cost of up to 30 KiB per slot. Decoded
+blocks are copied into PSRAM; the only whole-frame RGB565 storage is the
+display framebuffer. UDP remains best-effort: a missing chunk invalidates
+that JPEG frame, which is discarded after the 80 ms assembly timeout rather
+than partially shown. The PC sender spaces chunks by 1 ms to reduce receive
+bursts at the ESP.

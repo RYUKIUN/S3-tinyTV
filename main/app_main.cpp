@@ -1,19 +1,9 @@
 /*
  * ESP32-S3  |  ILI9341  |  SPI  |  320x240
  *
- * PIPELINE ARCHITECTURE — unchanged from the original project; see
- * PROJECT_STRUCTURE_AND_EXPLANATION.md for the full writeup. This file is
- * the direct port of the old main.cpp: setup() -> app_main(), the Arduino
- * loop() task -> decodeTask() (already was its own pinned task, nothing
- * changes there), and ArduinoOTA's own polling task -> a single otaStart()
- * call once WiFi is up (esp_http_server runs its own task internally, so
- * there's no task to spin up by hand anymore).
- *
- * Decode pipeline: esp_new_jpeg now does the tile decode (jpeg_decode.cpp)
- * instead of JPEGDEC. decodeTask() itself — the frame-assembly/ready-mask/
- * fallback-to-last-good-frame state machine below — did not need to change
- * at all: decodeSlot() kept the exact same (DecodeMsg, uint32_t&) ->
- * bool signature specifically so this wouldn't have to move.
+ * Full-frame pipeline: networkTask reassembles complete JPEGs in PSRAM,
+ * decodeTask decodes block-by-block into a free PSRAM framebuffer, and
+ * displayTask owns that framebuffer until asynchronous SPI DMA completes.
  */
 #include "nexus.h"
 #include "display.h"
@@ -35,20 +25,16 @@
 // WIFI_SSID / WIFI_PASS / OTA_HOSTNAME are #defines in nexus.h (Zone 1)
 // — edit them there, not here.
 
-// ─────────────────────────────────────────────
-//  PIPELINE SLOTS DEFINITIONS
-// ─────────────────────────────────────────────
-PipeSlot slot[MM_MAX_JPEG_SLOTS];
-
 uint16_t* frameFb[MM_MAX_DISPLAY_BUFS] = {};
-uint8_t   writeSet = 0;
+JpegFrameSlot jpegFrames[MM_MAX_JPEG_SLOTS] = {};
 
 uint8_t g_numJpegSlots   = CFG_NUM_JPEG_SLOTS;
 uint8_t g_numDisplayBufs = CFG_NUM_DISPLAY_BUFS;
 
+QueueHandle_t     jpegFreeQueue;
 QueueHandle_t     decodeQueue;
-SemaphoreHandle_t slotFree[MM_MAX_JPEG_SLOTS];
-QueueHandle_t displayQueue;
+QueueHandle_t     displayQueue;
+QueueHandle_t     framebufferFreeQueue;
 
 SemaphoreHandle_t g_spiMutex = nullptr;
 
@@ -83,17 +69,12 @@ static bool IRAM_ATTR idleHookCore1() {
 }
 
 // ─────────────────────────────────────────────
-//  CHUNK REASSEMBLY STATE DEFINITIONS
-// ─────────────────────────────────────────────
-TileState tiles[NUM_TILES];
-uint8_t*  tileChunkStorage[NUM_TILES] = {};
-
-// ─────────────────────────────────────────────
 //  CROSS-CORE STATS DEFINITIONS
 // ─────────────────────────────────────────────
 volatile uint32_t g_avgDecodeUs     = 0;
 volatile uint32_t g_presentedFrames = 0;
 volatile uint32_t g_abortedFrames   = 0;
+volatile uint32_t g_networkDrops    = 0;
 
 // ─────────────────────────────────────────────
 //  GLOBAL STATE DEFINITIONS
@@ -113,11 +94,23 @@ volatile uint32_t g_wifiConnectedMs  = 0;
 
 static void decodeTask(void*);
 
+static void resetJpegMetadata(JpegFrameSlot& frame) {
+    memset(frame.chunkReceived, 0, sizeof(frame.chunkReceived));
+    frame.frameId = 0xFF;
+    frame.totalChunks = 0;
+    frame.chunksReceived = 0;
+    frame.frameSize = 0;
+    frame.firstChunkMs = 0;
+    frame.receiving = false;
+    frame.queued = false;
+    frame.inUse = false;
+}
+
 // ─────────────────────────────────────────────
 //  app_main()  — was setup()
 // ─────────────────────────────────────────────
 extern "C" void app_main(void) {
-    printf("\n[BOOT] ping-pong pipeline (esp_new_jpeg decode, BE pixels)\n");
+    printf("\n[BOOT] full-frame pipeline (esp_new_jpeg block decode, BE pixels)\n");
 
     g_spiMutex = xSemaphoreCreateMutex();
 #if TOUCH_FEATURE_ENABLED
@@ -145,32 +138,45 @@ extern "C" void app_main(void) {
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
     if (!psramOk) { while (1) delay(1000); }
 
-    initJpegDecoder();
+    if (!initJpegDecoder()) {
+        statusLine(2, "Decoder:", "INIT FAILED!", TFT_RED);
+        while (1) delay(1000);
+    }
 
-    // ── JPEG assembly slots (SRAM) — fallback from CFG down to 1 ─────────────
+    // ── Full-frame JPEG slots: use SRAM for two hot-path buffers, then PSRAM.
     g_numJpegSlots = CFG_NUM_JPEG_SLOTS;
     while (g_numJpegSlots >= 1) {
         for (int s = 0; s < MM_MAX_JPEG_SLOTS; s++) {
-            if (slot[s].assembly) { heap_caps_free(slot[s].assembly); slot[s].assembly = nullptr; }
+            if (jpegFrames[s].data) {
+                heap_caps_free(jpegFrames[s].data);
+                jpegFrames[s].data = nullptr;
+            }
         }
         bool ok = true;
         for (int s = 0; s < g_numJpegSlots; s++) {
-            slot[s].assembly = (uint8_t*)heap_caps_aligned_alloc(
-                16, MAX_TILE_JPEG, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            if (!slot[s].assembly) { ok = false; break; }
+            uint32_t caps = s < 2
+                ? MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+                : MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+            jpegFrames[s].data = (uint8_t*)heap_caps_aligned_alloc(
+                16, MAX_JPEG_FRAME, caps);
+            if (jpegFrames[s].data == nullptr && s < 2) {
+                jpegFrames[s].data = (uint8_t*)heap_caps_aligned_alloc(
+                    16, MAX_JPEG_FRAME, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            }
+            if (!jpegFrames[s].data) { ok = false; break; }
         }
         if (ok) break;
-        printf("[WARN] JPEG slots %d failed — retrying with %d\n",
+        printf("[WARN] Full-frame JPEG buffers %d failed — retrying with %d\n",
                g_numJpegSlots, g_numJpegSlots - 1);
         g_numJpegSlots--;
     }
     if (g_numJpegSlots == 0) {
-        printf("[ERROR] Cannot allocate even 1 JPEG slot — halting\n");
-        statusLine(2, "Buffers:", "SRAM ALLOC FAILED!", TFT_RED);
+        printf("[ERROR] Cannot allocate even 1 full-frame JPEG buffer — halting\n");
+        statusLine(2, "Buffers:", "JPEG ALLOC FAILED!", TFT_RED);
         while (1) delay(1000);
     }
-    printf("[MEM] JPEG slots: %d / %d (CFG=%d)\n",
-           g_numJpegSlots, MM_MAX_JPEG_SLOTS, CFG_NUM_JPEG_SLOTS);
+    printf("[MEM] Full-frame JPEG buffers: %d / %d (up to %u bytes each, first 2 prefer SRAM, CFG=%d)\n",
+           g_numJpegSlots, MM_MAX_JPEG_SLOTS, (unsigned)MAX_JPEG_FRAME, CFG_NUM_JPEG_SLOTS);
 
     // ── Display framebuffers (PSRAM) — fallback from CFG down to 2 ───────────
     g_numDisplayBufs = CFG_NUM_DISPLAY_BUFS;
@@ -197,29 +203,30 @@ extern "C" void app_main(void) {
     printf("[MEM] Display bufs: %d / %d (CFG=%d)\n",
            g_numDisplayBufs, MM_MAX_DISPLAY_BUFS, CFG_NUM_DISPLAY_BUFS);
 
-    // ── Tile chunk storage (PSRAM) ────────────────────────────────────────────
-    bool allocOk = true;
-    for (int t = 0; t < NUM_TILES && allocOk; t++) {
-        tileChunkStorage[t] = (uint8_t*)heap_caps_malloc(
-            (size_t)MAX_TILE_CHUNKS * CHUNK_DATA_SIZE, MALLOC_CAP_SPIRAM);
-        if (!tileChunkStorage[t]) {
-            printf("[ERROR] tile[%d] chunkStorage PSRAM alloc failed\n", t);
-            allocOk = false; break;
-        }
-        for (int c = 0; c < MAX_TILE_CHUNKS; c++)
-            tiles[t].chunkBuf[c] = tileChunkStorage[t] + (size_t)c * CHUNK_DATA_SIZE;
-    }
-    if (!allocOk) {
-        statusLine(2, "Buffers:", "CHUNK ALLOC FAILED!", TFT_RED);
-        while (1) delay(1000);
-    }
-
     // ── Pipeline sync primitives ──────────────────────────────────────────────
+    jpegFreeQueue = xQueueCreate(g_numJpegSlots, sizeof(uint8_t));
     decodeQueue  = xQueueCreate(g_numJpegSlots,   sizeof(DecodeMsg));
     displayQueue = xQueueCreate(g_numDisplayBufs,  sizeof(DisplayMsg));
+    framebufferFreeQueue = xQueueCreate(g_numDisplayBufs, sizeof(uint8_t));
+    if (!jpegFreeQueue || !decodeQueue || !displayQueue || !framebufferFreeQueue) {
+        printf("[ERROR] Pipeline queue allocation failed\n");
+        statusLine(2, "Buffers:", "QUEUE ALLOC FAILED!", TFT_RED);
+        while (1) delay(1000);
+    }
     for (int s = 0; s < g_numJpegSlots; s++) {
-        slotFree[s] = xSemaphoreCreateBinary();
-        xSemaphoreGive(slotFree[s]);
+        uint8_t idx = (uint8_t)s;
+        resetJpegMetadata(jpegFrames[s]);
+        if (xQueueSend(jpegFreeQueue, &idx, 0) != pdTRUE) {
+            printf("[ERROR] Failed to initialize JPEG free queue\n");
+            while (1) delay(1000);
+        }
+    }
+    for (int s = 0; s < g_numDisplayBufs; s++) {
+        uint8_t idx = (uint8_t)s;
+        if (xQueueSend(framebufferFreeQueue, &idx, 0) != pdTRUE) {
+            printf("[ERROR] Failed to initialize framebuffer free queue\n");
+            while (1) delay(1000);
+        }
     }
 
     {
@@ -279,7 +286,7 @@ extern "C" void app_main(void) {
     // ── Streaming tasks ───────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(networkTask,     "NetTask",     10240, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(wifiWatchdogTask,"WifiWatchdog", 4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(displayTask,     "DispTask",     4096, NULL, 3, NULL, 0);
 
 #if TOUCH_FEATURE_ENABLED
     xTaskCreatePinnedToCore(touchTask,       "TouchTask",    6144, NULL, 1, NULL, 0);
@@ -301,195 +308,111 @@ extern "C" void app_main(void) {
 }
 
 // ─────────────────────────────────────────────
-//  DECODE TASK  (Core 1) — formerly Arduino loop()
-//  Unchanged: decodeSlot() keeps the same signature regardless of which
-//  JPEG library sits behind it, so none of this state machine moved.
+//  DECODE TASK (Core 1): full-frame JPEG to a free framebuffer.
 // ─────────────────────────────────────────────
 static void decodeTask(void*) {
-
-    bool     streamStarted = false;
-    uint32_t decodeAcc     = 0;
-    uint32_t decodeCount   = 0;
     uint32_t diagWindowMs = millis();
-    uint32_t diagTiles = 0, diagGoodTiles = 0, diagFrames = 0;
-    uint32_t diagDisplayDrops = 0, diagDecodeFailures = 0, diagFrameTimeouts = 0;
-    uint32_t diagFrameReplaced = 0;
-    uint32_t diagEmptyReplaced = 0, diagPartialFrames = 0;
-    uint32_t diagMissingTile[NUM_TILES] = {};
-    uint64_t diagQueueUs = 0, diagDecodeUs = 0, diagWorkUs = 0;
-    uint64_t diagFrameCopyUs = 0, diagDisplayQueueUs = 0;
-    uint32_t diagQueueMaxUs = 0, diagDecodeMaxUs = 0, diagWorkMaxUs = 0;
-    uint32_t diagFrameCopyMaxUs = 0, diagDisplayQueueMaxUs = 0;
-    uint32_t diagLastFrameUs = 0, diagFrameIntervalUs = 0, diagFrameIntervalMaxUs = 0;
-
-    uint8_t  pendingFrame = 0xFF;
-    uint8_t  readyMask    = 0;
-    uint32_t frameStartMs = 0;
-
-    uint32_t lastIv = 0;
+    uint32_t diagFrames = 0, diagFailures = 0, diagNoFramebuffer = 0;
+    uint64_t diagQueueUs = 0, diagDecodeUs = 0, diagCopyUs = 0;
+    uint32_t diagQueueMaxUs = 0, diagDecodeMaxUs = 0;
 
     for (;;) {
-
         DecodeMsg msg;
         if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) continue;
+
         uint32_t queueUs = micros() - msg.queuedAtUs;
         diagQueueUs += queueUs;
         if (queueUs > diagQueueMaxUs) diagQueueMaxUs = queueUs;
-        diagTiles++;
 
-        if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
-            diagFrameTimeouts++;
+        uint8_t jpegIdx = msg.jpegSlot;
+        uint8_t framebufferIdx = 0xFF;
+        uint32_t decodeUs = 0, copyUs = 0;
+        bool gotFramebuffer = xQueueReceive(
+            framebufferFreeQueue, &framebufferIdx, pdMS_TO_TICKS(50)) == pdTRUE;
+        bool ok = false;
+        if (gotFramebuffer) {
+            ok = decodeJpegFrame(msg, framebufferIdx, decodeUs, copyUs);
+        } else {
+            diagNoFramebuffer++;
+        }
+        diagDecodeUs += decodeUs;
+        diagCopyUs += copyUs;
+        if (decodeUs > diagDecodeMaxUs) diagDecodeMaxUs = decodeUs;
+
+        JpegFrameSlot& jpeg = jpegFrames[jpegIdx];
+        jpeg.frameId = 0xFF;
+        jpeg.totalChunks = 0;
+        jpeg.chunksReceived = 0;
+        jpeg.frameSize = 0;
+        jpeg.firstChunkMs = 0;
+        memset(jpeg.chunkReceived, 0, sizeof(jpeg.chunkReceived));
+        jpeg.receiving = false;
+        jpeg.queued = false;
+        jpeg.inUse = false;
+        if (xQueueSend(jpegFreeQueue, &jpegIdx, 0) != pdTRUE) {
+            ESP_LOGE("pipeline", "JPEG slot %u could not be returned", jpegIdx);
+        }
+
+        if (!ok) {
+            diagFailures++;
             g_abortedFrames = g_abortedFrames + 1;
-            pendingFrame = 0xFF;
-            readyMask    = 0;
-            frameStartMs = 0;
-        }
-
-        if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
-            if (pendingFrame != 0xFF) {
-                diagFrameReplaced++;
-                if (readyMask == 0) {
-                    diagEmptyReplaced++;
-                } else {
-                    diagPartialFrames++;
-                    for (uint8_t t = 0; t < NUM_TILES; t++) {
-                        if ((readyMask & (1u << t)) == 0) diagMissingTile[t]++;
-                    }
-                }
-                g_abortedFrames = g_abortedFrames + 1;
-            }
-            pendingFrame = msg.frameId;
-            readyMask    = 0;
-            frameStartMs = millis();
-        }
-
-        uint32_t decUs = 0;
-        uint32_t workStartUs = micros();
-        bool ok = decodeSlot(msg, decUs);
-        uint32_t workUs = micros() - workStartUs;
-        diagDecodeUs += decUs;
-        if (decUs > diagDecodeMaxUs) diagDecodeMaxUs = decUs;
-        diagWorkUs += workUs;
-        if (workUs > diagWorkMaxUs) diagWorkMaxUs = workUs;
-
-        xSemaphoreGive(slotFree[msg.slotIdx]);
-
-        if (ok) {
-            diagGoodTiles++;
-            tiles[msg.tId].stat_decoded++;
-            decodeAcc   += decUs;
-            decodeCount++;
-
-            readyMask |= (uint8_t)(1u << msg.tId);
-
-            if (decodeCount >= 16) {
-                g_avgDecodeUs = decodeAcc / decodeCount;
-                decodeAcc = 0; decodeCount = 0;
-            }
-
-            if (!streamStarted) {
-                streamStarted = true;
-                g_streaming   = true;
-                g_lastPktMs   = millis();
-                statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
-                delay(200);
-            }
-
-            if (readyMask == 0x0F) {
-                DisplayMsg dmsg = { msg.frameId, writeSet };
-                uint32_t displayQueueStartUs = micros();
-                if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
-                {
-                    g_abortedFrames = g_abortedFrames + 1;
-                    diagDisplayDrops++;
-                }
-                uint32_t displayQueueUs = micros() - displayQueueStartUs;
-                diagDisplayQueueUs += displayQueueUs;
-                if (displayQueueUs > diagDisplayQueueMaxUs)
-                    diagDisplayQueueMaxUs = displayQueueUs;
-
-                uint8_t justCompleted = writeSet;
-                writeSet = (writeSet + 1) % g_numDisplayBufs;
-
-                uint32_t copyStartUs = micros();
-                memcpy(frameFb[writeSet], frameFb[justCompleted],
-                       (size_t)SCREEN_W * SCREEN_H * 2);
-                uint32_t copyUs = micros() - copyStartUs;
-                diagFrameCopyUs += copyUs;
-                if (copyUs > diagFrameCopyMaxUs) diagFrameCopyMaxUs = copyUs;
-
-                uint32_t frameDoneUs = micros();
-                if (diagLastFrameUs != 0) {
-                    uint32_t intervalUs = frameDoneUs - diagLastFrameUs;
-                    diagFrameIntervalUs += intervalUs;
-                    if (intervalUs > diagFrameIntervalMaxUs)
-                        diagFrameIntervalMaxUs = intervalUs;
-                }
-                diagLastFrameUs = frameDoneUs;
-                diagFrames++;
-
-                readyMask    = 0;
-                pendingFrame = 0xFF;
-                frameStartMs = 0;
+            if (gotFramebuffer &&
+                xQueueSend(framebufferFreeQueue, &framebufferIdx, 0) != pdTRUE) {
+                ESP_LOGE("pipeline", "framebuffer %u could not be returned after decode failure",
+                         framebufferIdx);
             }
         } else {
-            diagDecodeFailures++;
-        }
+            DisplayMsg dmsg = { msg.frameId, framebufferIdx };
+            if (xQueueSend(displayQueue, &dmsg, 0) != pdTRUE) {
+                diagFailures++;
+                g_abortedFrames = g_abortedFrames + 1;
+                if (xQueueSend(framebufferFreeQueue, &framebufferIdx, 0) != pdTRUE) {
+                    ESP_LOGE("pipeline", "framebuffer %u could not be returned after queue failure",
+                             framebufferIdx);
+                }
+            } else {
+                diagFrames++;
+                g_avgDecodeUs = decodeUs;
+                if (!g_streaming) {
+                    g_streaming = true;
+                    statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
+                }
 
-        uint32_t diagNowMs = millis();
-        if ((diagNowMs - diagWindowMs) >= 1000) {
-            uint32_t elapsedMs = diagNowMs - diagWindowMs;
-            uint32_t frameIntervals = diagFrames > 0 ? diagFrames - 1 : 0;
-            ESP_LOGI("pipeline",
-                "DEC %lums tile=%lu/s ok=%lu/s q_us=%lu/%lu jpeg_us=%lu/%lu work_us=%lu/%lu frame=%lu/s frame_iv_us=%lu/%lu fbcopy_us=%lu/%lu dq_us=%lu/%lu ddrop=%lu dfail=%lu ftimeout=%lu freplace=%lu partial=%lu empty=%lu missing_tile=%lu,%lu,%lu,%lu ddepth=%u abort_total=%lu",
-                (unsigned long)elapsedMs,
-                (unsigned long)(diagTiles * 1000u / elapsedMs),
-                (unsigned long)(diagGoodTiles * 1000u / elapsedMs),
-                (unsigned long)(diagTiles ? diagQueueUs / diagTiles : 0),
-                (unsigned long)diagQueueMaxUs,
-                (unsigned long)(diagGoodTiles ? diagDecodeUs / diagGoodTiles : 0),
-                (unsigned long)diagDecodeMaxUs,
-                (unsigned long)(diagTiles ? diagWorkUs / diagTiles : 0),
-                (unsigned long)diagWorkMaxUs,
-                (unsigned long)(diagFrames * 1000u / elapsedMs),
-                (unsigned long)(frameIntervals ? diagFrameIntervalUs / frameIntervals : 0),
-                (unsigned long)diagFrameIntervalMaxUs,
-                (unsigned long)(diagFrames ? diagFrameCopyUs / diagFrames : 0),
-                (unsigned long)diagFrameCopyMaxUs,
-                (unsigned long)(diagFrames ? diagDisplayQueueUs / diagFrames : 0),
-                (unsigned long)diagDisplayQueueMaxUs,
-                (unsigned long)diagDisplayDrops,
-                (unsigned long)diagDecodeFailures,
-                (unsigned long)diagFrameTimeouts,
-                (unsigned long)diagFrameReplaced,
-                (unsigned long)diagPartialFrames,
-                (unsigned long)diagEmptyReplaced,
-                (unsigned long)diagMissingTile[0],
-                (unsigned long)diagMissingTile[1],
-                (unsigned long)diagMissingTile[2],
-                (unsigned long)diagMissingTile[3],
-                (unsigned)uxQueueMessagesWaiting(displayQueue),
-                (unsigned long)g_abortedFrames);
-            diagWindowMs = diagNowMs;
-            diagTiles = diagGoodTiles = diagFrames = 0;
-            diagDisplayDrops = diagDecodeFailures = diagFrameTimeouts = diagFrameReplaced = 0;
-            diagEmptyReplaced = diagPartialFrames = 0;
-            memset(diagMissingTile, 0, sizeof(diagMissingTile));
-            diagQueueUs = diagDecodeUs = diagWorkUs = diagFrameCopyUs = diagDisplayQueueUs = 0;
-            diagQueueMaxUs = diagDecodeMaxUs = diagWorkMaxUs = diagFrameCopyMaxUs = 0;
-            diagDisplayQueueMaxUs = 0;
-            diagFrameIntervalUs = diagFrameIntervalMaxUs = 0;
+            }
         }
 
         uint32_t now = millis();
         if (stat_prevMs > 0) {
-            uint32_t iv = now - stat_prevMs;
-            if (lastIv > 0) {
-                int32_t d = (int32_t)iv - (int32_t)lastIv;
-                stat_jitter += (fabsf((float)d) - stat_jitter) / 16.0f;
+            uint32_t interval = now - stat_prevMs;
+            static uint32_t lastInterval = 0;
+            if (lastInterval > 0) {
+                int32_t delta = (int32_t)interval - (int32_t)lastInterval;
+                stat_jitter += (fabsf((float)delta) - stat_jitter) / 16.0f;
             }
-            lastIv = iv;
+            lastInterval = interval;
         }
         stat_prevMs = now;
+
+        if ((now - diagWindowMs) >= 1000) {
+            uint32_t elapsedMs = now - diagWindowMs;
+            ESP_LOGI("pipeline",
+                "DEC %lums frame=%lu/s fail=%lu no_fb=%lu q_us=%lu/%lu jpeg_us=%lu/%lu copy_us=%lu fb_free=%u jpeg_q=%u disp_q=%u abort_total=%lu",
+                (unsigned long)elapsedMs,
+                (unsigned long)(diagFrames * 1000u / elapsedMs),
+                (unsigned long)diagFailures, (unsigned long)diagNoFramebuffer,
+                (unsigned long)(diagFrames ? diagQueueUs / diagFrames : 0),
+                (unsigned long)diagQueueMaxUs,
+                (unsigned long)(diagFrames ? diagDecodeUs / diagFrames : 0),
+                (unsigned long)diagDecodeMaxUs,
+                (unsigned long)(diagFrames ? diagCopyUs / diagFrames : 0),
+                (unsigned)uxQueueMessagesWaiting(framebufferFreeQueue),
+                (unsigned)uxQueueMessagesWaiting(jpegFreeQueue),
+                (unsigned)uxQueueMessagesWaiting(displayQueue),
+                (unsigned long)g_abortedFrames);
+            diagWindowMs = now;
+            diagFrames = diagFailures = diagNoFramebuffer = 0;
+            diagQueueUs = diagDecodeUs = diagCopyUs = 0;
+            diagQueueMaxUs = diagDecodeMaxUs = 0;
+        }
     }
 }

@@ -62,6 +62,7 @@ void displayTask(void*) {
 
     DisplayMsg dmsg;
     bool dmaPending    = false;  // true while a pushPixelsDMA transfer is in flight
+    uint8_t dmaBufferIdx = 0xFF;
     bool overlayVisible = false;
     uint32_t lastOverlayMs = 0;
     uint32_t diagWindowMs = millis();
@@ -85,6 +86,12 @@ void displayTask(void*) {
             lcd.endWrite();
             busUnlock();   // touch may have the bus now
             dmaPending = false;
+            if (dmaBufferIdx >= g_numDisplayBufs ||
+                xQueueSend(framebufferFreeQueue, &dmaBufferIdx, 0) != pdTRUE) {
+                ESP_LOGE("pipeline", "display framebuffer %u could not be returned",
+                         dmaBufferIdx);
+            }
+            dmaBufferIdx = 0xFF;
             uint32_t dmaUs = micros() - diagDmaStartUs;
             diagDmaUs += dmaUs;
             if (dmaUs > diagDmaMaxUs) diagDmaMaxUs = dmaUs;
@@ -137,6 +144,7 @@ void displayTask(void*) {
             lcd.startWrite();
             lcd.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
             lcd.pushPixelsDMA(frameFb[dmsg.bufSet], SCREEN_W * SCREEN_H);
+            dmaBufferIdx = dmsg.bufSet;
             dmaPending = true;
             continue;  // loop back immediately; don't touch bus until DMA is done
         }

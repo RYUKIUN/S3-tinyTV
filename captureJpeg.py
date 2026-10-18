@@ -43,11 +43,8 @@ EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแ
 COOLDOWN_FRAMES = 5
 
 CHUNK_DATA_SIZE  = 1400
-NUM_TILES        = 4
-TILE_W, TILE_H   = 160, 120
-TILE_X = [  0, 160,   0, 160]
-TILE_Y = [  0,   0, 120, 120]
-MAX_TILE_JPEG  = 33600
+MAX_FRAME_JPEG   = 30 * 1024
+CHUNK_PACE_S     = 0.0005
 
 WINDOW_NAME_BASE     = "ESP32-S3 Stream [320x240]"
 UI_W, UI_H           = 480, 600
@@ -55,7 +52,7 @@ PREVIEW_W, PREVIEW_H = 480, 360
 
 # Send rate is fixed — not user-adjustable — so the pipeline behaves the
 # same way every time instead of being a variable someone has to tune.
-BASE_FPS = 60
+BASE_FPS = 50
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5
@@ -612,7 +609,7 @@ def _send_udp(sock: socket.socket, data, dest):
         except BlockingIOError:
             time.sleep(SEND_RETRY_SLEEP_S)
 
-def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
+def send_frame(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
                quality: int, sub_flag: int, t_start: float, target_fps: int,
                send_buf: bytearray, send_view: memoryview, frame_id_box: list,
                prev_send_end: list = None) -> dict:
@@ -621,53 +618,57 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
     dest      = (target_ip, PORT)
     total_bytes = 0
 
-    # Network jitter from sender side: gap between consecutive send_tiles calls
+    # Network jitter from sender side: gap between consecutive frame sends
     now_call = time.perf_counter()
     send_interval_s = 0.0
     if prev_send_end is not None and prev_send_end[0] > 0:
         send_interval_s = now_call - prev_send_end[0]
 
-    # 1. Encode all tiles
+    # 1. Encode one complete image, lowering quality only if the protocol cap
+    #    would otherwise be exceeded.
     encode_start = time.perf_counter()
-    encoded_tiles = []
-    for tId in range(NUM_TILES):
-        x, y = TILE_X[tId], TILE_Y[tId]
-        tile = frame_bgr[y:y+TILE_H, x:x+TILE_W]
-        _, enc = cv2.imencode('.jpg', tile, [int(cv2.IMWRITE_JPEG_QUALITY), quality,
-                                              int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
-        encoded_tiles.append(enc)
-        total_bytes += len(enc)
+    frame_quality = quality
+    while True:
+        ok, encoded = cv2.imencode(
+            '.jpg', frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), frame_quality,
+             int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sub_flag])
+        if not ok:
+            raise RuntimeError("JPEG encode failed for full frame")
+        total_bytes = len(encoded)
+        if total_bytes <= MAX_FRAME_JPEG:
+            break
+        if frame_quality <= 5:
+            raise RuntimeError(
+                f"Full-frame JPEG is still {total_bytes} bytes at minimum quality "
+                f"{frame_quality}; ESP limit is {MAX_FRAME_JPEG} bytes")
+        frame_quality = max(5, frame_quality - 5)
     encode_time_s = time.perf_counter() - encode_start
 
-    # 2. Calculate Pacing
-    overhead_time = time.perf_counter() - t_start
+    # 2. Pace packets within the frame so the ESP's UDP receive queue is not
+    #    hit by a full frame-sized burst.
     frame_budget  = 1.0 / max(1, target_fps)
-    idle_time     = frame_budget - overhead_time
-    auto_pacing_s = max(0.0, idle_time / NUM_TILES)
 
-    # 3. Transmit
+    # 3. Transmit contiguous chunks of the complete JPEG.
     send_time_s = 0.0
-    paced_tiles = 0
-    for tId, enc in enumerate(encoded_tiles):
-        total_len = len(enc)
-        if total_len > MAX_TILE_JPEG: continue
+    total_len = len(encoded)
+    enc_view = memoryview(encoded)
+    num_chunks = (total_len + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
+    size_hi, size_lo = (total_len >> 8) & 0xFF, total_len & 0xFF
+    for cId in range(num_chunks):
+        offset = cId * CHUNK_DATA_SIZE
+        clen = min(CHUNK_DATA_SIZE, total_len - offset)
+        send_buf[0:8] = [0xAA, 0xBB, frame_id, cId, num_chunks, 0, size_hi, size_lo]
+        send_buf[8:8+clen] = enc_view[offset:offset+clen]
+        send_start = time.perf_counter()
+        _send_udp(sock, send_view[:8+clen], dest)
+        send_time_s += time.perf_counter() - send_start
+        if cId + 1 < num_chunks:
+            time.sleep(CHUNK_PACE_S)
 
-        enc_view     = memoryview(enc)
-        num_chunks   = (total_len + CHUNK_DATA_SIZE - 1) // CHUNK_DATA_SIZE
-        size_hi, size_lo = (total_len >> 8) & 0xFF, total_len & 0xFF
-
-        for cId in range(num_chunks):
-            offset = cId * CHUNK_DATA_SIZE
-            clen   = min(CHUNK_DATA_SIZE, total_len - offset)
-            send_buf[0:8] = [0xAA, 0xBB, frame_id, tId, cId, num_chunks, size_hi, size_lo]
-            send_buf[8:8+clen] = enc_view[offset:offset+clen]
-            send_start = time.perf_counter()
-            _send_udp(sock, send_view[:8+clen], dest)
-            send_time_s += time.perf_counter() - send_start
-
-        if auto_pacing_s > 0:
-            time.sleep(auto_pacing_s)
-            paced_tiles += 1
+    auto_pacing_s = max(0.0, frame_budget - (time.perf_counter() - t_start))
+    if auto_pacing_s > 0:
+        time.sleep(auto_pacing_s)
 
     call_end = time.perf_counter()
     if prev_send_end is not None:
@@ -678,8 +679,10 @@ def send_tiles(sock: socket.socket, target_ip: str, frame_bgr: np.ndarray,
         "encode_s": encode_time_s,
         "send_s": send_time_s,
         "auto_pacing_s": auto_pacing_s,
-        "paced_tiles": paced_tiles,
+        "paced_frames": int(auto_pacing_s > 0),
         "send_interval_s": send_interval_s,
+        "quality_fallback": int(frame_quality < quality),
+        "frame_quality": frame_quality,
     }
 
 # ─────────────────────────────────────────────
@@ -885,7 +888,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     threading.Thread(target=capture_worker, args=(monitor_idx_box, frame_queue, stop_event, mss_lock), daemon=True).start()
 
     m_left, m_top, m_w, m_h = monitor_info.get("left", 0), monitor_info.get("top", 0), monitor_info.get("width", ESP_W), monitor_info.get("height", ESP_H)
-    latest_esp_stats, last_debug_send, last_frame_bytes = {}, 0, {"bytes": 0, "encode_s": 0.0, "send_s": 0.0, "auto_pacing_s": 0.0, "paced_tiles": 0, "send_interval_s": 0.0}
+    latest_esp_stats, last_debug_send, last_frame_bytes = {}, 0, {"bytes": 0, "encode_s": 0.0, "send_s": 0.0, "auto_pacing_s": 0.0, "paced_frames": 0, "send_interval_s": 0.0, "quality_fallback": 0, "frame_quality": 0}
     touch = TouchInjector()
     last_touch_send = 0
     prev_send_end   = [0.0]
@@ -1021,8 +1024,10 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 s = sharpen_steps * 0.1
                 resized = cv2.addWeighted(resized, 1.0 + s, cv2.GaussianBlur(resized, (0,0), 0.3 + s*0.35), -s, 0)
 
-            last_frame_bytes = send_tiles(sock, target_ip, resized, current_qual, sub_flag, t_start, BASE_FPS,
-                                           send_buf, send_view, frame_id_box, prev_send_end)
+            last_frame_bytes = send_frame(sock, target_ip, resized, current_qual, sub_flag, t_start, BASE_FPS,
+                                          send_buf, send_view, frame_id_box, prev_send_end)
+            if last_frame_bytes["frame_quality"] < current_qual:
+                current_qual = last_frame_bytes["frame_quality"]
 
             # ── PC FPS measurement (1-second sliding window) ──
             pc_fps_counter += 1
@@ -1224,6 +1229,10 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                      _pct_ratio(str(int(ema_avg_bytes or 0)), 0, magic_threshold)),
                     ("QUALITY",    f"{current_qual}",               (255, 255, 255),
                      _pct_ratio(str(current_qual), 0, 95)),
+                    ("Q FALLBACK", "YES" if last_frame_bytes["quality_fallback"] else "NO",
+                     UI_WARN if last_frame_bytes["quality_fallback"] else UI_OK, None),
+                    ("FRAME Q", f"{last_frame_bytes['frame_quality']}", UI_ACCENT,
+                     _pct_ratio(str(last_frame_bytes["frame_quality"]), 0, 95)),
                     ("PRIORITY",   priority_label,                  UI_ACCENT, None),
                     ("TARGET FPS", f"{BASE_FPS}",                   UI_LABEL_COL, None),
                 ]
