@@ -55,7 +55,7 @@ PREVIEW_W, PREVIEW_H = 480, 360
 
 # Send rate is fixed — not user-adjustable — so the pipeline behaves the
 # same way every time instead of being a variable someone has to tune.
-BASE_FPS = 45
+BASE_FPS = 60
 
 CURSOR_OUTER_R = 8
 CURSOR_INNER_R = 5

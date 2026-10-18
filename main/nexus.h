@@ -146,7 +146,7 @@ static const int16_t TILE_Y[NUM_TILES] = {  0,   0, 120, 120 };
 // SRAM is the scarce resource here, don't raise this casually.
 // CFG_NUM_DISPLAY_BUFS lives in PSRAM (8 MB, much more headroom) — safe to
 // raise a buffer or two if you want more slack absorbing display jitter.
-#define CFG_NUM_JPEG_SLOTS    4   // desired JPEG slots  (1–6)
+#define CFG_NUM_JPEG_SLOTS    3   // desired JPEG slots  (1–6)
 #define CFG_NUM_DISPLAY_BUFS  3   // desired display bufs (2–6)
 
 // Hard array caps — do NOT exceed. These size the actual arrays; the
@@ -249,6 +249,7 @@ struct DecodeMsg {
     uint8_t  tId;
     uint8_t  slotIdx;
     uint16_t len;
+    uint32_t queuedAtUs;
 };
 
 struct DisplayMsg {

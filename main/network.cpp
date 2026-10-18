@@ -133,6 +133,15 @@ void networkTask(void*) {
     socklen_t slen = sizeof(sender);
     uint32_t lastPktMs = millis(), lastBeaconMs = 0, lastStatMs = 0;
     uint8_t back = 0;
+    uint32_t diagWindowMs = millis();
+    uint32_t diagRxPackets = 0, diagTiles = 0;
+    uint32_t diagTileTimeouts = 0, diagBadTiles = 0, diagQueueFailures = 0;
+    uint32_t diagCompleteByTile[NUM_TILES] = {};
+    uint32_t diagReplaceByTile[NUM_TILES] = {};
+    uint32_t diagIncompleteChunks = 0, diagExpectedChunksAtReplace = 0;
+    uint32_t diagInvalidChunks = 0, diagInvalidHeaders = 0;
+    uint64_t diagSlotWaitUs = 0, diagAssembleUs = 0, diagQueueWaitUs = 0;
+    uint32_t diagSlotWaitMaxUs = 0, diagAssembleMaxUs = 0, diagQueueWaitMaxUs = 0;
 
     while (true) {
         int n = recvfrom(g_sock, rxBuf, sizeof(rxBuf), 0,
@@ -177,30 +186,49 @@ void networkTask(void*) {
         }
 
         if (rxBuf[1] != 0xBB || n < 8) { portYIELD(); continue; }
+        diagRxPackets++;
         uint8_t  fId     = rxBuf[2];
         uint8_t  tId     = rxBuf[3];
         uint8_t  cId     = rxBuf[4];
         uint8_t  nChunks = rxBuf[5];
         uint16_t fSize   = ((uint16_t)rxBuf[6] << 8) | rxBuf[7];
         int      dataLen = n - 8;
-        if (tId >= NUM_TILES || dataLen <= 0) { portYIELD(); continue; }
+        if (tId >= NUM_TILES || dataLen <= 0) { diagInvalidHeaders++; portYIELD(); continue; }
+        if (nChunks == 0 || nChunks > MAX_TILE_CHUNKS ||
+            cId >= nChunks || dataLen > CHUNK_DATA_SIZE ||
+            fSize == 0 || fSize > MAX_TILE_JPEG) {
+            diagInvalidChunks++;
+            portYIELD();
+            continue;
+        }
 
         TileState& ts = tiles[tId];
 
         if (ts.firstChunkMs > 0 && (millis() - ts.firstChunkMs) > TILE_TIMEOUT_MS) {
             ts.stat_timeout++;
+            diagTileTimeouts++;
             resetTile(tId);
         }
 
         if (fId != ts.frameId) {
+            if (ts.firstChunkMs > 0) {
+                diagReplaceByTile[tId]++;
+                diagIncompleteChunks += ts.totalChunks - ts.chunksGot;
+                diagExpectedChunksAtReplace += ts.totalChunks;
+            }
             resetTile(tId);
             ts.frameId      = fId;
-            ts.totalChunks  = (nChunks > MAX_TILE_CHUNKS) ? MAX_TILE_CHUNKS : nChunks;
+            ts.totalChunks  = nChunks;
             ts.frameSize    = fSize;
             ts.firstChunkMs = millis();
+        } else if (ts.totalChunks != nChunks || ts.frameSize != fSize) {
+            diagInvalidHeaders++;
+            resetTile(tId);
+            portYIELD();
+            continue;
         }
 
-        if (cId < MAX_TILE_CHUNKS && !ts.chunkGot[cId]) {
+        if (!ts.chunkGot[cId]) {
             memcpy(ts.chunkBuf[cId], &rxBuf[8], dataLen);
             ts.chunkLen[cId] = (uint16_t)dataLen;
             ts.chunkGot[cId] = true;
@@ -208,17 +236,81 @@ void networkTask(void*) {
         }
 
         if (ts.chunksGot >= ts.totalChunks) {
+            uint32_t t0 = micros();
             xSemaphoreTake(slotFree[back], portMAX_DELAY);
-            int len = assembleTileInto(tId, slot[back].assembly);
+            uint32_t slotWaitUs = micros() - t0;
+            diagSlotWaitUs += slotWaitUs;
+            if (slotWaitUs > diagSlotWaitMaxUs) diagSlotWaitMaxUs = slotWaitUs;
 
-            if (len > 0) {
-                DecodeMsg msg = { fId, tId, back, (uint16_t)len };
-                xQueueSend(decodeQueue, &msg, portMAX_DELAY);
-                back = (back + 1) % g_numJpegSlots;
+            t0 = micros();
+            int len = assembleTileInto(tId, slot[back].assembly);
+            uint32_t assembleUs = micros() - t0;
+            diagAssembleUs += assembleUs;
+            if (assembleUs > diagAssembleMaxUs) diagAssembleMaxUs = assembleUs;
+
+                if (len > 0 && len == ts.frameSize) {
+                    DecodeMsg msg = { fId, tId, back, (uint16_t)len, micros() };
+                t0 = micros();
+                BaseType_t queued = xQueueSend(decodeQueue, &msg, portMAX_DELAY);
+                uint32_t queueWaitUs = micros() - t0;
+                diagQueueWaitUs += queueWaitUs;
+                if (queueWaitUs > diagQueueWaitMaxUs) diagQueueWaitMaxUs = queueWaitUs;
+                if (queued == pdTRUE) {
+                    diagTiles++;
+                    diagCompleteByTile[tId]++;
+                    back = (back + 1) % g_numJpegSlots;
+                } else {
+                    diagQueueFailures++;
+                    xSemaphoreGive(slotFree[back]);
+                    ESP_LOGE(TAG, "decode queue send failed");
+                }
             } else {
+                diagBadTiles++;
+                if (len > 0) ts.stat_corrupt++;
                 xSemaphoreGive(slotFree[back]);
             }
             resetTile(tId);
+        }
+
+        uint32_t diagNowMs = millis();
+        if ((diagNowMs - diagWindowMs) >= 1000) {
+            uint32_t elapsedMs = diagNowMs - diagWindowMs;
+            uint32_t slotAvg = diagTiles ? (uint32_t)(diagSlotWaitUs / diagTiles) : 0;
+            uint32_t assembleAvg = diagTiles + diagBadTiles
+                ? (uint32_t)(diagAssembleUs / (diagTiles + diagBadTiles)) : 0;
+            uint32_t queueAvg = diagTiles ? (uint32_t)(diagQueueWaitUs / diagTiles) : 0;
+            ESP_LOGI(TAG,
+                "NET %lums rx=%lu/s tile=%lu/s tile_id=%lu,%lu,%lu,%lu replace_id=%lu,%lu,%lu,%lu incomplete_chunks=%lu/%lu invalid=%lu/%lu slot_us=%lu/%lu asm_us=%lu/%lu qwait_us=%lu/%lu qdepth=%u timeout=%lu bad=%lu qfail=%lu",
+                (unsigned long)elapsedMs,
+                (unsigned long)(diagRxPackets * 1000u / elapsedMs),
+                (unsigned long)(diagTiles * 1000u / elapsedMs),
+                (unsigned long)(diagCompleteByTile[0] * 1000u / elapsedMs),
+                (unsigned long)(diagCompleteByTile[1] * 1000u / elapsedMs),
+                (unsigned long)(diagCompleteByTile[2] * 1000u / elapsedMs),
+                (unsigned long)(diagCompleteByTile[3] * 1000u / elapsedMs),
+                (unsigned long)diagReplaceByTile[0],
+                (unsigned long)diagReplaceByTile[1],
+                (unsigned long)diagReplaceByTile[2],
+                (unsigned long)diagReplaceByTile[3],
+                (unsigned long)diagIncompleteChunks,
+                (unsigned long)diagExpectedChunksAtReplace,
+                (unsigned long)diagInvalidChunks,
+                (unsigned long)diagInvalidHeaders,
+                (unsigned long)slotAvg, (unsigned long)diagSlotWaitMaxUs,
+                (unsigned long)assembleAvg, (unsigned long)diagAssembleMaxUs,
+                (unsigned long)queueAvg, (unsigned long)diagQueueWaitMaxUs,
+                (unsigned)uxQueueMessagesWaiting(decodeQueue),
+                (unsigned long)diagTileTimeouts,
+                (unsigned long)diagBadTiles, (unsigned long)diagQueueFailures);
+            diagWindowMs = diagNowMs;
+            diagRxPackets = diagTiles = 0;
+            diagTileTimeouts = diagBadTiles = diagQueueFailures = 0;
+            diagIncompleteChunks = diagExpectedChunksAtReplace = 0;
+            diagInvalidChunks = diagInvalidHeaders = 0;
+            memset(diagCompleteByTile, 0, sizeof(diagCompleteByTile));
+            memset(diagReplaceByTile, 0, sizeof(diagReplaceByTile));
+            diagSlotWaitUs = diagAssembleUs = diagQueueWaitUs = 0;
+            diagSlotWaitMaxUs = diagAssembleMaxUs = diagQueueWaitMaxUs = 0;
         }
 
         if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > DEBUGINTERVAL) {

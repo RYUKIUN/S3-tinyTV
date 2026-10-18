@@ -27,6 +27,7 @@
 #include "esp_psram.h"
 #include "esp_system.h"
 #include "esp_freertos_hooks.h"
+#include "esp_log.h"
 #include "freertos/task.h"
 #include <cstring>
 #include <cstdio>
@@ -309,6 +310,17 @@ static void decodeTask(void*) {
     bool     streamStarted = false;
     uint32_t decodeAcc     = 0;
     uint32_t decodeCount   = 0;
+    uint32_t diagWindowMs = millis();
+    uint32_t diagTiles = 0, diagGoodTiles = 0, diagFrames = 0;
+    uint32_t diagDisplayDrops = 0, diagDecodeFailures = 0, diagFrameTimeouts = 0;
+    uint32_t diagFrameReplaced = 0;
+    uint32_t diagEmptyReplaced = 0, diagPartialFrames = 0;
+    uint32_t diagMissingTile[NUM_TILES] = {};
+    uint64_t diagQueueUs = 0, diagDecodeUs = 0, diagWorkUs = 0;
+    uint64_t diagFrameCopyUs = 0, diagDisplayQueueUs = 0;
+    uint32_t diagQueueMaxUs = 0, diagDecodeMaxUs = 0, diagWorkMaxUs = 0;
+    uint32_t diagFrameCopyMaxUs = 0, diagDisplayQueueMaxUs = 0;
+    uint32_t diagLastFrameUs = 0, diagFrameIntervalUs = 0, diagFrameIntervalMaxUs = 0;
 
     uint8_t  pendingFrame = 0xFF;
     uint8_t  readyMask    = 0;
@@ -320,27 +332,50 @@ static void decodeTask(void*) {
 
         DecodeMsg msg;
         if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) continue;
+        uint32_t queueUs = micros() - msg.queuedAtUs;
+        diagQueueUs += queueUs;
+        if (queueUs > diagQueueMaxUs) diagQueueMaxUs = queueUs;
+        diagTiles++;
 
         if (pendingFrame != 0xFF && frameStartMs > 0 && (millis() - frameStartMs) > 150) {
+            diagFrameTimeouts++;
+            g_abortedFrames = g_abortedFrames + 1;
             pendingFrame = 0xFF;
             readyMask    = 0;
             frameStartMs = 0;
         }
 
         if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
-            if (pendingFrame != 0xFF && readyMask != 0)
+            if (pendingFrame != 0xFF) {
+                diagFrameReplaced++;
+                if (readyMask == 0) {
+                    diagEmptyReplaced++;
+                } else {
+                    diagPartialFrames++;
+                    for (uint8_t t = 0; t < NUM_TILES; t++) {
+                        if ((readyMask & (1u << t)) == 0) diagMissingTile[t]++;
+                    }
+                }
                 g_abortedFrames = g_abortedFrames + 1;
+            }
             pendingFrame = msg.frameId;
             readyMask    = 0;
             frameStartMs = millis();
         }
 
         uint32_t decUs = 0;
+        uint32_t workStartUs = micros();
         bool ok = decodeSlot(msg, decUs);
+        uint32_t workUs = micros() - workStartUs;
+        diagDecodeUs += decUs;
+        if (decUs > diagDecodeMaxUs) diagDecodeMaxUs = decUs;
+        diagWorkUs += workUs;
+        if (workUs > diagWorkMaxUs) diagWorkMaxUs = workUs;
 
         xSemaphoreGive(slotFree[msg.slotIdx]);
 
         if (ok) {
+            diagGoodTiles++;
             tiles[msg.tId].stat_decoded++;
             decodeAcc   += decUs;
             decodeCount++;
@@ -362,19 +397,88 @@ static void decodeTask(void*) {
 
             if (readyMask == 0x0F) {
                 DisplayMsg dmsg = { msg.frameId, writeSet };
+                uint32_t displayQueueStartUs = micros();
                 if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
+                {
                     g_abortedFrames = g_abortedFrames + 1;
+                    diagDisplayDrops++;
+                }
+                uint32_t displayQueueUs = micros() - displayQueueStartUs;
+                diagDisplayQueueUs += displayQueueUs;
+                if (displayQueueUs > diagDisplayQueueMaxUs)
+                    diagDisplayQueueMaxUs = displayQueueUs;
 
                 uint8_t justCompleted = writeSet;
                 writeSet = (writeSet + 1) % g_numDisplayBufs;
 
+                uint32_t copyStartUs = micros();
                 memcpy(frameFb[writeSet], frameFb[justCompleted],
                        (size_t)SCREEN_W * SCREEN_H * 2);
+                uint32_t copyUs = micros() - copyStartUs;
+                diagFrameCopyUs += copyUs;
+                if (copyUs > diagFrameCopyMaxUs) diagFrameCopyMaxUs = copyUs;
+
+                uint32_t frameDoneUs = micros();
+                if (diagLastFrameUs != 0) {
+                    uint32_t intervalUs = frameDoneUs - diagLastFrameUs;
+                    diagFrameIntervalUs += intervalUs;
+                    if (intervalUs > diagFrameIntervalMaxUs)
+                        diagFrameIntervalMaxUs = intervalUs;
+                }
+                diagLastFrameUs = frameDoneUs;
+                diagFrames++;
 
                 readyMask    = 0;
                 pendingFrame = 0xFF;
                 frameStartMs = 0;
             }
+        } else {
+            diagDecodeFailures++;
+        }
+
+        uint32_t diagNowMs = millis();
+        if ((diagNowMs - diagWindowMs) >= 1000) {
+            uint32_t elapsedMs = diagNowMs - diagWindowMs;
+            uint32_t frameIntervals = diagFrames > 0 ? diagFrames - 1 : 0;
+            ESP_LOGI("pipeline",
+                "DEC %lums tile=%lu/s ok=%lu/s q_us=%lu/%lu jpeg_us=%lu/%lu work_us=%lu/%lu frame=%lu/s frame_iv_us=%lu/%lu fbcopy_us=%lu/%lu dq_us=%lu/%lu ddrop=%lu dfail=%lu ftimeout=%lu freplace=%lu partial=%lu empty=%lu missing_tile=%lu,%lu,%lu,%lu ddepth=%u abort_total=%lu",
+                (unsigned long)elapsedMs,
+                (unsigned long)(diagTiles * 1000u / elapsedMs),
+                (unsigned long)(diagGoodTiles * 1000u / elapsedMs),
+                (unsigned long)(diagTiles ? diagQueueUs / diagTiles : 0),
+                (unsigned long)diagQueueMaxUs,
+                (unsigned long)(diagGoodTiles ? diagDecodeUs / diagGoodTiles : 0),
+                (unsigned long)diagDecodeMaxUs,
+                (unsigned long)(diagTiles ? diagWorkUs / diagTiles : 0),
+                (unsigned long)diagWorkMaxUs,
+                (unsigned long)(diagFrames * 1000u / elapsedMs),
+                (unsigned long)(frameIntervals ? diagFrameIntervalUs / frameIntervals : 0),
+                (unsigned long)diagFrameIntervalMaxUs,
+                (unsigned long)(diagFrames ? diagFrameCopyUs / diagFrames : 0),
+                (unsigned long)diagFrameCopyMaxUs,
+                (unsigned long)(diagFrames ? diagDisplayQueueUs / diagFrames : 0),
+                (unsigned long)diagDisplayQueueMaxUs,
+                (unsigned long)diagDisplayDrops,
+                (unsigned long)diagDecodeFailures,
+                (unsigned long)diagFrameTimeouts,
+                (unsigned long)diagFrameReplaced,
+                (unsigned long)diagPartialFrames,
+                (unsigned long)diagEmptyReplaced,
+                (unsigned long)diagMissingTile[0],
+                (unsigned long)diagMissingTile[1],
+                (unsigned long)diagMissingTile[2],
+                (unsigned long)diagMissingTile[3],
+                (unsigned)uxQueueMessagesWaiting(displayQueue),
+                (unsigned long)g_abortedFrames);
+            diagWindowMs = diagNowMs;
+            diagTiles = diagGoodTiles = diagFrames = 0;
+            diagDisplayDrops = diagDecodeFailures = diagFrameTimeouts = diagFrameReplaced = 0;
+            diagEmptyReplaced = diagPartialFrames = 0;
+            memset(diagMissingTile, 0, sizeof(diagMissingTile));
+            diagQueueUs = diagDecodeUs = diagWorkUs = diagFrameCopyUs = diagDisplayQueueUs = 0;
+            diagQueueMaxUs = diagDecodeMaxUs = diagWorkMaxUs = diagFrameCopyMaxUs = 0;
+            diagDisplayQueueMaxUs = 0;
+            diagFrameIntervalUs = diagFrameIntervalMaxUs = 0;
         }
 
         uint32_t now = millis();
