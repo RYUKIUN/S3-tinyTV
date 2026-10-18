@@ -80,7 +80,7 @@ void displayTask(void*) {
             lcd.endWrite();
             busUnlock();   // touch may have the bus now
             dmaPending = false;
-            g_presentedFrames++;
+            g_presentedFrames = g_presentedFrames + 1;
             overlayVisible = false;
             esp_task_wdt_reset();
         }

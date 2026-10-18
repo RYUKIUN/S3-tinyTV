@@ -10,6 +10,15 @@
 static const char* TAG = "wifi";
 static esp_netif_t* s_staNetif = nullptr;
 
+void nvsInit() {
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+}
+
 static void wifiEventHandler(void* /*arg*/, esp_event_base_t base,
                               int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -26,13 +35,6 @@ static void wifiEventHandler(void* /*arg*/, esp_event_base_t base,
 }
 
 void wifiInit() {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_staNetif = esp_netif_create_default_wifi_sta();
@@ -64,7 +66,7 @@ void wifiInit() {
                                      // actual radiated power may be clamped
                                      // lower by regional regulatory limits
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
-    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW40);
 }
 
 void wifiReconnect() {

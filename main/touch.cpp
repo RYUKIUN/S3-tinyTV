@@ -7,6 +7,9 @@
  * Preferences, and native driver/gpio.h replacing Arduino's pinMode/
  * attachInterrupt/digitalPinToInterrupt/FALLING/INPUT_PULLUP.)
  */
+#include "nexus.h"
+
+#if TOUCH_FEATURE_ENABLED
 #include "touch.h"
 #include "display.h"
 #include "nvs.h"
@@ -89,22 +92,41 @@ static void IRAM_ATTR bootIsr(void* /*arg*/) {
 // build is still readable here (and vice versa).
 static bool loadCalibration(TouchCal& cal) {
     nvs_handle_t h;
-    if (nvs_open("touch", NVS_READONLY, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_open("touch", NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return false;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to open calibration storage: %s", esp_err_to_name(err));
+        return false;
+    }
 
     size_t len = sizeof(TouchCal);
-    esp_err_t err = nvs_get_blob(h, "cal", &cal, &len);
+    err = nvs_get_blob(h, "cal", &cal, &len);
     nvs_close(h);
 
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "failed to read calibration: %s", esp_err_to_name(err));
+        return false;
+    }
     if (err != ESP_OK || len != sizeof(TouchCal)) return false;
     return (cal.magic == TOUCH_CAL_MAGIC && cal.version == TOUCH_CAL_VERSION);
 }
 
-static void saveCalibration(const TouchCal& cal) {
+static bool saveCalibration(const TouchCal& cal) {
     nvs_handle_t h;
-    if (nvs_open("touch", NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_blob(h, "cal", &cal, sizeof(TouchCal));
-    nvs_commit(h);
+    esp_err_t err = nvs_open("touch", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to open calibration storage: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_blob(h, "cal", &cal, sizeof(TouchCal));
+    if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to save calibration: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 static bool solveLinear(double A[TOUCH_CAL_TERMS][TOUCH_CAL_TERMS],
@@ -285,20 +307,22 @@ static void runCalibration() {
 
     s_cal.magic   = TOUCH_CAL_MAGIC;
     s_cal.version = TOUCH_CAL_VERSION;
-    saveCalibration(s_cal);
+    bool saved = saveCalibration(s_cal);
     g_touchCalibrated = true;
 
     ESP_LOGI(TAG, "Calibrated: %d points, RMS %.2f px", TOUCH_CAL_NPOINTS, rms);
 
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(rms <= TOUCH_CAL_MAX_RMS ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-    lcd.drawString("Calibration saved.", 8, 90);
+    lcd.drawString(saved ? "Calibration saved." : "Save failed - check log.",
+                   8, 90);
     lcd.setTextColor(0x7BEF, TFT_BLACK);
     {
         char msg[40];
         snprintf(msg, sizeof(msg), "accuracy: %.1f px RMS", rms);
         lcd.drawString(msg, 8, 112);
     }
+
     delay(1400);
 }
 
@@ -452,3 +476,5 @@ void touchTask(void*) {
         vTaskDelay(pressed ? samplePeriod : idlePeriod);
     }
 }
+
+#endif

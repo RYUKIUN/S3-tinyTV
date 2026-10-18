@@ -49,8 +49,14 @@ Every setting you need to change for YOUR hardware/network is in
 - `WIFI_SSID` / `WIFI_PASS` — your network.
 - `LCD_PIN_*` / `TOUCH_PIN_*` — your panel's wiring, if it differs from the
   defaults documented there and in `HARDWARE.md`.
+- `TOUCH_FEATURE_ENABLED` — set to `0` in `main/nexus.h` to disable touch
+  setup, calibration, sampling, and touch event networking.
 - `TOUCH_USE_IRQ` — leave at `0` unless PENIRQ is actually wired; see the
   comment there, this one is not just a performance knob.
+
+Touch calibration is stored in NVS and reused after power cycles. The first
+boot after erasing NVS (or changing the calibration format) requires a
+calibration; double-press BOOT before streaming to recalibrate later.
 
 Zone 2–3 (display geometry, pipeline depth, timing) have sane defaults for
 a 320×240 panel and shouldn't need touching for the same hardware this was

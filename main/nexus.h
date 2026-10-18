@@ -115,7 +115,7 @@
 // stream starts to force a touch recalibration — see touch.cpp.
 #define BOOT_PIN        0
 
-// 1 = touch enabled, 0 = touch disabled (compiles touch support out entirely)
+// Set to 0 to disable touch setup, calibration, sampling, and network events.
 #define TOUCH_FEATURE_ENABLED 1
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -330,6 +330,7 @@ extern SemaphoreHandle_t g_spiMutex;
 // wire. Touch never calls sendto() itself — the socket stays owned by the one
 // task that already runs on the core the LWIP stack lives on, so there's no
 // concurrent-socket question and no second task blocking in the network stack.
+#if TOUCH_FEATURE_ENABLED
 struct TouchEvent {
     uint8_t  kind;    // TOUCH_EV_DOWN / _MOVE / _UP
     uint8_t  touchId; // increments on every new press; lets the PC spot a lost DOWN
@@ -340,6 +341,7 @@ struct TouchEvent {
 extern QueueHandle_t     touchQueue;
 extern volatile bool     g_touchEnabled;   // set by the PC over the 0xAA 0xCC control channel
 extern volatile bool     g_touchCalibrated;
+#endif
 
 // ── Display double-buffer write index (Core-1 exclusive) ─────────────────────
 extern uint8_t writeSet;

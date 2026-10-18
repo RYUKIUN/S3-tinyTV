@@ -60,6 +60,11 @@ and brings 7-sample hardware median filtering and affine calibration for free.
 | SCLK / MOSI | 12 / 13 | shared with the panel |
 | BOOT button | 0 | `BOOT_PIN` — double-press before streaming starts to recalibrate |
 
+Set `TOUCH_FEATURE_ENABLED` to `0` in `main/nexus.h` to disable touch
+initialization, calibration, sampling, and event networking. With touch
+enabled, calibration is saved to NVS and reused after power cycles; it runs
+again only when no valid saved calibration exists or BOOT is double-pressed.
+
 - Read clock: 1 MHz (`TOUCH_SPI_HZ`). One read is 57 bytes ≈ **456 µs**.
 - **MISO is declared on the panel's bus config**, not just the touch config.
   LovyanGFX's `spi::init()` guards `spi_bus_initialize()` behind "does this host

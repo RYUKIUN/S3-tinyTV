@@ -10,5 +10,6 @@
       "--background-index",
       "--query-driver=**",
       "--compile-commands-dir=d:\\PlatformIO\\ESP_project_codex\\S3-nextgen-jpeg(ESP-IDF)\\idf_project\\build"
-    ]
+    ],
+    "idf.port": "COM6"
 }

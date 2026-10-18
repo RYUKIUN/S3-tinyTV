@@ -51,9 +51,11 @@ QueueHandle_t displayQueue;
 
 SemaphoreHandle_t g_spiMutex = nullptr;
 
+#if TOUCH_FEATURE_ENABLED
 QueueHandle_t     touchQueue        = nullptr;
 volatile bool     g_touchEnabled    = true;
 volatile bool     g_touchCalibrated = false;
+#endif
 
 // ─────────────────────────────────────────────
 //  PER-CORE CPU UTILISATION (esp_freertos_hooks.h is a genuine ESP-IDF
@@ -117,18 +119,26 @@ extern "C" void app_main(void) {
     printf("\n[BOOT] ping-pong pipeline (esp_new_jpeg decode, BE pixels)\n");
 
     g_spiMutex = xSemaphoreCreateMutex();
+#if TOUCH_FEATURE_ENABLED
     touchQueue = xQueueCreate(TOUCH_EVENT_QUEUE_LEN, sizeof(TouchEvent));
+#endif
 
     lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
+
+    nvsInit();
 
 #if TOUCH_FEATURE_ENABLED
     touchBegin();
 #endif
 
     drawBootHeader();
+#if TOUCH_FEATURE_ENABLED
     statusLine(0, "Display:", g_touchCalibrated ? "OK + Touch" : "OK (no touch cal)",
                g_touchCalibrated ? TFT_GREEN : TFT_YELLOW);
+#else
+    statusLine(0, "Display:", "OK (touch disabled)", TFT_GREEN);
+#endif
 
     bool psramOk = esp_psram_is_initialized();
     statusLine(1, "PSRAM:", psramOk ? "Found" : "MISSING!", psramOk ? TFT_GREEN : TFT_RED);
@@ -319,7 +329,7 @@ static void decodeTask(void*) {
 
         if (pendingFrame == 0xFF || msg.frameId != pendingFrame) {
             if (pendingFrame != 0xFF && readyMask != 0)
-                g_abortedFrames++;
+                g_abortedFrames = g_abortedFrames + 1;
             pendingFrame = msg.frameId;
             readyMask    = 0;
             frameStartMs = millis();
@@ -353,7 +363,7 @@ static void decodeTask(void*) {
             if (readyMask == 0x0F) {
                 DisplayMsg dmsg = { msg.frameId, writeSet };
                 if (xQueueSend(displayQueue, &dmsg, pdMS_TO_TICKS(20)) != pdTRUE)
-                    g_abortedFrames++;
+                    g_abortedFrames = g_abortedFrames + 1;
 
                 uint8_t justCompleted = writeSet;
                 writeSet = (writeSet + 1) % g_numDisplayBufs;

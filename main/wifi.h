@@ -13,8 +13,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Brings up nvs_flash (WiFi needs it for calibration data), the netif +
-// default event loop, and the WiFi driver, then starts association.
+// Initializes NVS storage. Call before touchBegin() so the calibration can
+// be loaded before WiFi starts.
+void nvsInit();
+
+// Brings up the netif + default event loop and WiFi driver, then starts
+// association. NVS must already have been initialized with nvsInit().
 // g_wifiOk / g_wifiConnectedMs (nexus.h) are updated asynchronously by
 // the internal event handler from here on — call once, early in
 // app_main(). Connecting itself is NOT blocking; app_main() polls

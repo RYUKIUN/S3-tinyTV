@@ -3,8 +3,9 @@
 #include "wifi.h"
 #include "nexus.h"
 #include "esp_heap_caps.h"
-#include "driver/temp_sensor.h"
+#include "driver/temperature_sensor.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
 
 /*
  * REBASE NOTE: only two things changed here vs. the Arduino version —
@@ -13,22 +14,45 @@
  *     and g_wifiOk (set asynchronously by wifi.cpp's event handler) instead
  *     of polling WiFi.status() synchronously.
  *  2. Arduino's temperatureRead() became the native ESP-IDF temperature
- *     sensor driver (driver/temp_sensor.h), which needs a one-time install.
+ *     sensor driver, which needs a one-time install and enable.
  * Everything else — the UDP assembly state machine, chunk reassembly,
  * stats packet, touch event draining — is untouched.
  */
 
+static const char* TAG = "network";
+static temperature_sensor_handle_t s_tempSensor = nullptr;
+static bool s_tempSensorInitAttempted = false;
 static bool s_tempSensorReady = false;
 
 static float readChipTempC() {
-    if (!s_tempSensorReady) {
-        temp_sensor_config_t cfg = TSENS_CONFIG_DEFAULT();
-        if (temp_sensor_set_config(cfg) != ESP_OK) return 0.0f;
-        if (temp_sensor_start() != ESP_OK) return 0.0f;
+    if (!s_tempSensorInitAttempted) {
+        s_tempSensorInitAttempted = true;
+        const temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+        esp_err_t err = temperature_sensor_install(&cfg, &s_tempSensor);
+        if (err == ESP_OK) {
+            err = temperature_sensor_enable(s_tempSensor);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "temperature sensor initialization failed: %s", esp_err_to_name(err));
+            if (s_tempSensor != nullptr) {
+                esp_err_t cleanupErr = temperature_sensor_uninstall(s_tempSensor);
+                if (cleanupErr != ESP_OK) {
+                    ESP_LOGW(TAG, "temperature sensor cleanup failed: %s", esp_err_to_name(cleanupErr));
+                }
+                s_tempSensor = nullptr;
+            }
+            return 0.0f;
+        }
         s_tempSensorReady = true;
     }
+    if (!s_tempSensorReady) return 0.0f;
+
     float tC = 0.0f;
-    temp_sensor_read_celsius(&tC);
+    esp_err_t err = temperature_sensor_get_celsius(s_tempSensor, &tC);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "temperature sensor read failed: %s", esp_err_to_name(err));
+        return 0.0f;
+    }
     return tC;
 }
 
@@ -63,6 +87,7 @@ static IRAM_ATTR int assembleTileInto(uint8_t t, uint8_t* dst) {
 
 // Drains touchTask's queue onto the wire. Called from networkTask's own loop so
 // the UDP socket is only ever used by one task.
+#if TOUCH_FEATURE_ENABLED
 static void flushTouchEvents() {
     if (!g_remoteAddrValid || touchQueue == nullptr) return;
 
@@ -83,6 +108,7 @@ static void flushTouchEvents() {
                (struct sockaddr*)&g_remoteAddr, sizeof(g_remoteAddr));
     }
 }
+#endif
 
 void networkTask(void*) {
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -113,7 +139,9 @@ void networkTask(void*) {
                          (struct sockaddr*)&sender, &slen);
 
         if (n < 0) {
+#if TOUCH_FEATURE_ENABLED
             flushTouchEvents();
+#endif
 
             fd_set rfds; FD_ZERO(&rfds); FD_SET(g_sock, &rfds);
             struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
@@ -141,7 +169,9 @@ void networkTask(void*) {
 
         if (rxBuf[1] == 0xCC) {
             if (n >= 4 && rxBuf[2] == 0x01) debugEnabled = (rxBuf[3] == 1);
+#if TOUCH_FEATURE_ENABLED
             if (n >= 4 && rxBuf[2] == 0x02) g_touchEnabled = (rxBuf[3] == 1);
+#endif
             portYIELD();
             continue;
         }
@@ -247,7 +277,9 @@ void networkTask(void*) {
             lastStatMs = millis();
         }
 
+#if TOUCH_FEATURE_ENABLED
         flushTouchEvents();
+#endif
         portYIELD();
     }
 }

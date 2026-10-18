@@ -21,6 +21,7 @@ idf_component_register(
         esp_event
         esp_timer
         esp_psram
+        esp_driver_tsens
         driver
         esp_http_server
         app_update
