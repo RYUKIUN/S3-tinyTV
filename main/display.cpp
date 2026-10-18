@@ -65,11 +65,6 @@ void displayTask(void*) {
     uint8_t dmaBufferIdx = 0xFF;
     bool overlayVisible = false;
     uint32_t lastOverlayMs = 0;
-    uint32_t diagWindowMs = millis();
-    uint32_t diagDmaFrames = 0, diagLockWaitUs = 0, diagLockWaitMaxUs = 0;
-    uint64_t diagDmaUs = 0;
-    uint32_t diagDmaMaxUs = 0, diagDmaStartUs = 0;
-
     while (true) {
         // ── Poll DMA completion — yield cooperatively while busy ──────────────
         // pushPixelsDMA returns immediately; we loop here with taskYIELD() so
@@ -92,29 +87,8 @@ void displayTask(void*) {
                          dmaBufferIdx);
             }
             dmaBufferIdx = 0xFF;
-            uint32_t dmaUs = micros() - diagDmaStartUs;
-            diagDmaUs += dmaUs;
-            if (dmaUs > diagDmaMaxUs) diagDmaMaxUs = dmaUs;
-            diagDmaFrames++;
             g_presentedFrames = g_presentedFrames + 1;
             overlayVisible = false;
-            uint32_t diagNowMs = millis();
-            if ((diagNowMs - diagWindowMs) >= 1000) {
-                uint32_t elapsedMs = diagNowMs - diagWindowMs;
-                ESP_LOGI("pipeline",
-                    "DISP %lums dma=%lu/s dma_us=%lu/%lu lock_us=%lu/%lu qdepth=%u presented_total=%lu",
-                    (unsigned long)elapsedMs,
-                    (unsigned long)(diagDmaFrames * 1000u / elapsedMs),
-                    (unsigned long)(diagDmaFrames ? diagDmaUs / diagDmaFrames : 0),
-                    (unsigned long)diagDmaMaxUs,
-                    (unsigned long)(diagDmaFrames ? diagLockWaitUs / diagDmaFrames : 0),
-                    (unsigned long)diagLockWaitMaxUs,
-                    (unsigned)uxQueueMessagesWaiting(displayQueue),
-                    (unsigned long)g_presentedFrames);
-                diagWindowMs = diagNowMs;
-                diagDmaFrames = diagLockWaitUs = diagLockWaitMaxUs = diagDmaMaxUs = 0;
-                diagDmaUs = 0;
-            }
             esp_task_wdt_reset();
         }
 
@@ -135,12 +109,7 @@ void displayTask(void*) {
             // is safe — the only other holder is touchTask, which holds it for
             // one bounded 456 us read and is priority-boosted to get out of the
             // way the instant we ask for it.
-            uint32_t lockStartUs = micros();
             busLock();
-            uint32_t lockWaitUs = micros() - lockStartUs;
-            diagLockWaitUs += lockWaitUs;
-            if (lockWaitUs > diagLockWaitMaxUs) diagLockWaitMaxUs = lockWaitUs;
-            diagDmaStartUs = micros();
             lcd.startWrite();
             lcd.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
             lcd.pushPixelsDMA(frameFb[dmsg.bufSet], SCREEN_W * SCREEN_H);

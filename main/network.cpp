@@ -120,14 +120,6 @@ void networkTask(void*) {
     struct sockaddr_in sender;
     socklen_t slen = sizeof(sender);
     uint32_t lastPktMs = millis(), lastBeaconMs = 0, lastStatMs = 0;
-    uint32_t diagWindowMs = millis();
-    uint32_t diagRxPackets = 0, diagFramesQueued = 0, diagFrameDrops = 0;
-    uint32_t diagTimeouts = 0, diagBadFrames = 0, diagNoBuffer = 0;
-    uint32_t diagDuplicateChunks = 0, diagQueueFull = 0, diagMissingChunks = 0;
-    uint32_t diagChunksMissingOnTimeout = 0;
-    uint32_t diagInvalidPackets = 0;
-    uint64_t diagAssemblyUs = 0;
-    uint32_t diagAssemblyMaxUs = 0;
     bool droppedFrameActive = false;
     uint8_t droppedFrameId = 0;
 
@@ -143,12 +135,9 @@ void networkTask(void*) {
             JpegFrameSlot& frame = jpegFrames[i];
             if (!frame.queued || frame.receiving) continue;
 
-            DecodeMsg msg = { frame.frameId, i, frame.frameSize, micros() };
+            DecodeMsg msg = { frame.frameId, i, frame.frameSize };
             if (xQueueSend(decodeQueue, &msg, 0) == pdTRUE) {
                 frame.queued = false;
-                diagFramesQueued++;
-            } else {
-                diagQueueFull++;
             }
         }
     };
@@ -164,11 +153,6 @@ void networkTask(void*) {
                 continue;
             }
 
-            diagTimeouts++;
-            diagFrameDrops++;
-            uint32_t missingChunks = frame.totalChunks - frame.chunksReceived;
-            diagMissingChunks += missingChunks;
-            diagChunksMissingOnTimeout += missingChunks;
             g_networkDrops = g_networkDrops + 1;
             g_abortedFrames = g_abortedFrames + 1;
             if (droppedFrameActive && droppedFrameId == frame.frameId) {
@@ -219,7 +203,6 @@ void networkTask(void*) {
         }
 
         if (rxBuf[1] != 0xBB || n < 8) { portYIELD(); continue; }
-        diagRxPackets++;
         uint8_t  fId     = rxBuf[2];
         uint8_t  cId     = rxBuf[3];
         uint8_t  nChunks = rxBuf[4];
@@ -234,7 +217,6 @@ void networkTask(void*) {
             fSize > MAX_JPEG_FRAME || nChunks == 0 ||
             nChunks != expectedChunks || cId >= nChunks ||
             dataLen != expectedLen) {
-            diagInvalidPackets++;
             g_networkDrops = g_networkDrops + 1;
             portYIELD();
             continue;
@@ -262,8 +244,6 @@ void networkTask(void*) {
             if (xQueueReceive(jpegFreeQueue, &freeIdx, 0) != pdTRUE) {
                 droppedFrameActive = true;
                 droppedFrameId = fId;
-                diagNoBuffer++;
-                diagFrameDrops++;
                 g_networkDrops = g_networkDrops + 1;
                 g_abortedFrames = g_abortedFrames + 1;
                 portYIELD();
@@ -282,25 +262,17 @@ void networkTask(void*) {
 
         JpegFrameSlot& frame = jpegFrames[frameIdx];
         if (frame.queued) {
-            diagDuplicateChunks++;
             portYIELD();
             continue;
         }
         if (!frame.receiving || frame.totalChunks != nChunks ||
             frame.frameSize != fSize) {
-            diagInvalidPackets++;
             portYIELD();
             continue;
         }
 
-        if (frame.chunkReceived[cId]) {
-            diagDuplicateChunks++;
-        } else {
-            uint32_t copyStartUs = micros();
+        if (!frame.chunkReceived[cId]) {
             memcpy(frame.data + chunkOffset, &rxBuf[8], (size_t)dataLen);
-            uint32_t assemblyUs = micros() - copyStartUs;
-            diagAssemblyUs += assemblyUs;
-            if (assemblyUs > diagAssemblyMaxUs) diagAssemblyMaxUs = assemblyUs;
             frame.chunkReceived[cId] = true;
             frame.chunksReceived++;
         }
@@ -309,8 +281,6 @@ void networkTask(void*) {
             if (frame.data[0] != 0xFF || frame.data[1] != 0xD8 ||
                 frame.data[frame.frameSize - 2] != 0xFF ||
                 frame.data[frame.frameSize - 1] != 0xD9) {
-                diagBadFrames++;
-                diagFrameDrops++;
                 g_networkDrops = g_networkDrops + 1;
                 g_abortedFrames = g_abortedFrames + 1;
                 returnJpegSlot((uint8_t)frameIdx);
@@ -318,38 +288,6 @@ void networkTask(void*) {
                 frame.receiving = false;
                 frame.queued = true;
             }
-        }
-
-        uint32_t diagNowMs = millis();
-        if ((diagNowMs - diagWindowMs) >= 1000) {
-            uint32_t elapsedMs = diagNowMs - diagWindowMs;
-            uint32_t assembling = 0, completePending = 0;
-            for (uint8_t i = 0; i < g_numJpegSlots; ++i) {
-                assembling += jpegFrames[i].receiving;
-                completePending += jpegFrames[i].queued;
-            }
-            ESP_LOGI(TAG,
-                "NET %lums rx=%lu/s frame_q=%lu/s assembling=%lu pending=%lu incomplete=%lu chunks_missing=%lu timeout_missing=%lu invalid=%lu dup=%lu no_buf=%lu qfull=%lu timeout=%lu bad=%lu copy_us=%lu/%lu",
-                (unsigned long)elapsedMs,
-                (unsigned long)(diagRxPackets * 1000u / elapsedMs),
-                (unsigned long)(diagFramesQueued * 1000u / elapsedMs),
-                (unsigned long)assembling, (unsigned long)completePending,
-                (unsigned long)diagFrameDrops, (unsigned long)diagMissingChunks,
-                (unsigned long)diagChunksMissingOnTimeout,
-                (unsigned long)diagInvalidPackets,
-                (unsigned long)diagDuplicateChunks,
-                (unsigned long)diagNoBuffer, (unsigned long)diagQueueFull,
-                (unsigned long)diagTimeouts, (unsigned long)diagBadFrames,
-                (unsigned long)(diagRxPackets ? diagAssemblyUs / diagRxPackets : 0),
-                (unsigned long)diagAssemblyMaxUs);
-            diagWindowMs = diagNowMs;
-            diagRxPackets = diagFramesQueued = diagFrameDrops = 0;
-            diagTimeouts = diagBadFrames = diagNoBuffer = 0;
-            diagDuplicateChunks = diagQueueFull = diagMissingChunks = 0;
-            diagChunksMissingOnTimeout = 0;
-            diagInvalidPackets = 0;
-            diagAssemblyUs = 0;
-            diagAssemblyMaxUs = 0;
         }
 
         if (debugEnabled && g_remoteAddrValid && (millis() - lastStatMs) > DEBUGINTERVAL) {

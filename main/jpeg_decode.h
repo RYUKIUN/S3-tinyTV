@@ -4,4 +4,4 @@
 
 bool initJpegDecoder();
 bool decodeJpegFrame(const DecodeMsg& msg, uint8_t framebufferIdx,
-                     uint32_t& decodeUs, uint32_t& copyUs);
+                     uint32_t& decodeUs);

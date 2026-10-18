@@ -131,13 +131,13 @@
 // ── Network chunking ──────────────────────────────────────────────────────
 #define DEBUGINTERVAL 300                   // ms between debug stats packets
 #define CHUNK_DATA_SIZE  1400              // bytes of JPEG payload per UDP packet
-#define MAX_JPEG_FRAME   (30 * 1024)       // conservative per-frame JPEG cap: 30 KiB
+#define MAX_JPEG_FRAME   (35 * 1024)       // per-frame JPEG allocation/transport cap: 35 KiB
 #define MAX_FRAME_CHUNKS ((MAX_JPEG_FRAME + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE)
 
 // ── Pipeline depth (memory budget) ────────────────────────────────────────
-// JPEG frame buffers and display framebuffers both live in PSRAM.
-// The decoder's small block scratch buffer stays in internal SRAM.
-// More JPEG slots absorb network/decode jitter at a cost of up to 30 KiB each.
+// JPEG frame buffers prefer internal SRAM for the first two slots, with
+// PSRAM fallback; remaining slots use PSRAM. Decoder block scratch stays in SRAM.
+// More JPEG slots absorb network/decode jitter at a cost of up to 35 KiB each.
 #define CFG_NUM_JPEG_SLOTS    3   // desired full-frame JPEG buffers (1–6)
 #define CFG_NUM_DISPLAY_BUFS  3   // desired display bufs (2–6)
 
@@ -246,7 +246,6 @@ struct DecodeMsg {
     uint8_t  frameId;
     uint8_t  jpegSlot;
     uint16_t len;
-    uint32_t queuedAtUs;
 };
 
 struct DisplayMsg {

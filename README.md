@@ -100,7 +100,7 @@ the plain IP always works.)
      settings → Kconfig symbols in `sdkconfig.defaults`.
 
 2. **JPEG decoder: `esp_new_jpeg`, full-frame block mode.** The PC sends one
-   JPEG per captured frame, capped at 30 KiB and sent with 1 ms gaps between
+   JPEG per captured frame, capped at 35 KiB and sent with 1 ms gaps between
    chunks to reduce UDP bursts. The ESP assembles it in a PSRAM ring slot,
    then decodes 8/16-row blocks into a small aligned internal-RAM
    scratch buffer and copies each block directly into a free PSRAM framebuffer.

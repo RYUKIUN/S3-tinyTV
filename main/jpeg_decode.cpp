@@ -35,9 +35,8 @@ bool initJpegDecoder() {
 }
 
 bool decodeJpegFrame(const DecodeMsg& msg, uint8_t framebufferIdx,
-                     uint32_t& decodeUs, uint32_t& copyUs) {
+                     uint32_t& decodeUs) {
     decodeUs = 0;
-    copyUs = 0;
     if (!s_jpegDec || !s_blockOut || msg.jpegSlot >= g_numJpegSlots ||
         framebufferIdx >= g_numDisplayBufs || frameFb[framebufferIdx] == nullptr) {
         return false;
@@ -73,7 +72,6 @@ bool decodeJpegFrame(const DecodeMsg& msg, uint8_t framebufferIdx,
     size_t outputOffset = 0;
     uint8_t* frameOut = (uint8_t*)frameFb[framebufferIdx];
     uint32_t decodeTotalUs = 0;
-    uint32_t copyTotalUs = 0;
 
     for (int block = 0; block < processCount; ++block) {
         uint32_t decodeStart = micros();
@@ -82,17 +80,13 @@ bool decodeJpegFrame(const DecodeMsg& msg, uint8_t framebufferIdx,
         if (result != JPEG_ERR_OK || io.out_size <= 0 ||
             (size_t)io.out_size > frameBytes - outputOffset) {
             decodeUs = micros() - t0;
-            copyUs = copyTotalUs;
             return false;
         }
 
-        uint32_t copyStart = micros();
         memcpy(frameOut + outputOffset, s_blockOut, (size_t)io.out_size);
-        copyTotalUs += micros() - copyStart;
         outputOffset += (size_t)io.out_size;
     }
 
     decodeUs = decodeTotalUs;
-    copyUs = copyTotalUs;
     return outputOffset == frameBytes;
 }

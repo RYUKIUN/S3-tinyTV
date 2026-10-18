@@ -311,33 +311,19 @@ extern "C" void app_main(void) {
 //  DECODE TASK (Core 1): full-frame JPEG to a free framebuffer.
 // ─────────────────────────────────────────────
 static void decodeTask(void*) {
-    uint32_t diagWindowMs = millis();
-    uint32_t diagFrames = 0, diagFailures = 0, diagNoFramebuffer = 0;
-    uint64_t diagQueueUs = 0, diagDecodeUs = 0, diagCopyUs = 0;
-    uint32_t diagQueueMaxUs = 0, diagDecodeMaxUs = 0;
-
     for (;;) {
         DecodeMsg msg;
         if (xQueueReceive(decodeQueue, &msg, pdMS_TO_TICKS(40)) != pdTRUE) continue;
 
-        uint32_t queueUs = micros() - msg.queuedAtUs;
-        diagQueueUs += queueUs;
-        if (queueUs > diagQueueMaxUs) diagQueueMaxUs = queueUs;
-
         uint8_t jpegIdx = msg.jpegSlot;
         uint8_t framebufferIdx = 0xFF;
-        uint32_t decodeUs = 0, copyUs = 0;
+        uint32_t decodeUs = 0;
         bool gotFramebuffer = xQueueReceive(
             framebufferFreeQueue, &framebufferIdx, pdMS_TO_TICKS(50)) == pdTRUE;
         bool ok = false;
         if (gotFramebuffer) {
-            ok = decodeJpegFrame(msg, framebufferIdx, decodeUs, copyUs);
-        } else {
-            diagNoFramebuffer++;
+            ok = decodeJpegFrame(msg, framebufferIdx, decodeUs);
         }
-        diagDecodeUs += decodeUs;
-        diagCopyUs += copyUs;
-        if (decodeUs > diagDecodeMaxUs) diagDecodeMaxUs = decodeUs;
 
         JpegFrameSlot& jpeg = jpegFrames[jpegIdx];
         jpeg.frameId = 0xFF;
@@ -354,7 +340,6 @@ static void decodeTask(void*) {
         }
 
         if (!ok) {
-            diagFailures++;
             g_abortedFrames = g_abortedFrames + 1;
             if (gotFramebuffer &&
                 xQueueSend(framebufferFreeQueue, &framebufferIdx, 0) != pdTRUE) {
@@ -364,20 +349,17 @@ static void decodeTask(void*) {
         } else {
             DisplayMsg dmsg = { msg.frameId, framebufferIdx };
             if (xQueueSend(displayQueue, &dmsg, 0) != pdTRUE) {
-                diagFailures++;
                 g_abortedFrames = g_abortedFrames + 1;
                 if (xQueueSend(framebufferFreeQueue, &framebufferIdx, 0) != pdTRUE) {
                     ESP_LOGE("pipeline", "framebuffer %u could not be returned after queue failure",
                              framebufferIdx);
                 }
             } else {
-                diagFrames++;
                 g_avgDecodeUs = decodeUs;
                 if (!g_streaming) {
                     g_streaming = true;
                     statusLine(6, "Status:", "STREAMING!", TFT_GREEN);
                 }
-
             }
         }
 
@@ -392,27 +374,5 @@ static void decodeTask(void*) {
             lastInterval = interval;
         }
         stat_prevMs = now;
-
-        if ((now - diagWindowMs) >= 1000) {
-            uint32_t elapsedMs = now - diagWindowMs;
-            ESP_LOGI("pipeline",
-                "DEC %lums frame=%lu/s fail=%lu no_fb=%lu q_us=%lu/%lu jpeg_us=%lu/%lu copy_us=%lu fb_free=%u jpeg_q=%u disp_q=%u abort_total=%lu",
-                (unsigned long)elapsedMs,
-                (unsigned long)(diagFrames * 1000u / elapsedMs),
-                (unsigned long)diagFailures, (unsigned long)diagNoFramebuffer,
-                (unsigned long)(diagFrames ? diagQueueUs / diagFrames : 0),
-                (unsigned long)diagQueueMaxUs,
-                (unsigned long)(diagFrames ? diagDecodeUs / diagFrames : 0),
-                (unsigned long)diagDecodeMaxUs,
-                (unsigned long)(diagFrames ? diagCopyUs / diagFrames : 0),
-                (unsigned)uxQueueMessagesWaiting(framebufferFreeQueue),
-                (unsigned)uxQueueMessagesWaiting(jpegFreeQueue),
-                (unsigned)uxQueueMessagesWaiting(displayQueue),
-                (unsigned long)g_abortedFrames);
-            diagWindowMs = now;
-            diagFrames = diagFailures = diagNoFramebuffer = 0;
-            diagQueueUs = diagDecodeUs = diagCopyUs = 0;
-            diagQueueMaxUs = diagDecodeMaxUs = 0;
-        }
     }
 }

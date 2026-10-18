@@ -20,19 +20,10 @@ ESP_W, ESP_H = 320, 240
 WIFI_SSID = "Endmin"
 WIFI_PASS = "987654321"
 
-# Priority presets: one trackbar step picks BOTH the per-frame byte budget
-# the controller targets (4:2:0 chroma only — that's the only mode this
-# sends now) AND the quality ceiling it's allowed to climb back up to.
-# Index 0 = most FPS-protective, last index = most quality-protective.
-# (label, magic_bytes_threshold, auto_max_quality)
-PRIORITY_PRESETS = [
-    ("MAX FPS",      8000, 45),
-    ("FAST",        10500, 60),
-    ("BALANCED",    13000, 70),
-    ("QUALITY",      16500, 80),
-    ("MAX QUALITY", 20000, 90),
-]
-PRIORITY_DEFAULT_IDX = 2  # BALANCED
+# The encoder always targets the max-quality preset; quality still drops
+# automatically when frames exceed the byte budget.
+QUALITY_BYTE_THRESHOLD = 25000
+MAX_QUALITY = 80
 
 # EMA Settings (Low-pass filter for bitrate)
 EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแต่ตอบสนองช้าลง (แนะนำ 0.1 - 0.2)
@@ -40,11 +31,11 @@ EMA_ALPHA = 0.2  # ค่ายิ่งน้อย ยิ่งสมูทแ
 # After an overflow streak, how many consecutive under-threshold frames the
 # EMA must hold before quality is allowed to climb back up. Prevents
 # climbing right back into the same complex scene on one calmer frame.
-COOLDOWN_FRAMES = 5
+COOLDOWN_FRAMES = 3
 
 CHUNK_DATA_SIZE  = 1400
-MAX_FRAME_JPEG   = 30 * 1024
-CHUNK_PACE_S     = 0.0005
+MAX_FRAME_JPEG   = 35 * 1024
+CHUNK_PACE_S     = 0.00025
 
 WINDOW_NAME_BASE     = "ESP32-S3 Stream [320x240]"
 UI_W, UI_H           = 480, 600
@@ -74,7 +65,7 @@ UNIX_NICE_LEVEL      = -10
 
 # All instances share one settings file beside this script; the latest save wins.
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-SETTINGS_KEYS = ("Priority", "Sharpen", "Debug Mode", "Enable Touch")
+SETTINGS_KEYS = ("Sharpen", "Debug Mode", "Enable Touch")
 
 # Rediscovery: how often the main process re-checks for new ESPs after the
 # first one has already been picked up (seconds).
@@ -847,19 +838,14 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     all_monitors = list_monitor_candidates()   # [(idx, dict), ...] fixed for the session
     max_monitor_idx = max((i for i, _ in all_monitors), default=1)
 
-    # Five controls, each self-explanatory from its own label (OpenCV's
+    # Four controls, each self-explanatory from its own label (OpenCV's
     # trackbar UI has no separate space for tooltips, so the name itself
     # has to carry the explanation):
-    #   Priority     — which PRIORITY_PRESETS step the byte-budget
-    #                  controller targets; 0 = protect FPS hardest,
-    #                  max = protect quality hardest. The controller
-    #                  always runs — this only moves its goalposts.
     #   Sharpen      — 0 = off, higher = crisper edges
     #   Debug Mode   — 0 = clean preview, 1 = ESP stats overlay, 2 = PC encoder stats overlay
     #   Enable Touch — 0 = ESP touchscreen ignored, 1 = it drives this mouse
     #   Monitor      — which screen to capture
     _tb_cfg = {
-        "Priority":     (PRIORITY_DEFAULT_IDX, len(PRIORITY_PRESETS) - 1),
         "Sharpen":      (10, 20),
         "Debug Mode":   (1, 2),
         "Enable Touch": (1, 1),
@@ -896,10 +882,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
     pc_fps_last_ts  = time.perf_counter()
     pc_fps_actual   = 0.0
     ema_jitter_s    = None
-    _init_preset_idx = saved_data.get("Priority", PRIORITY_DEFAULT_IDX)
-    if not (0 <= _init_preset_idx < len(PRIORITY_PRESETS)):
-        _init_preset_idx = PRIORITY_DEFAULT_IDX
-    current_qual = PRIORITY_PRESETS[_init_preset_idx][2]
+    current_qual = MAX_QUALITY
     current_monitor_idx = monitor_idx
 
     # EMA Accumulator
@@ -913,7 +896,6 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1: break
             t_start = time.perf_counter()
 
-            priority_idx   = cv2.getTrackbarPos("Priority", window_name)
             sharpen_steps  = cv2.getTrackbarPos("Sharpen", window_name)
             debug_state    = cv2.getTrackbarPos("Debug Mode", window_name)
             touch_state    = cv2.getTrackbarPos("Enable Touch", window_name)
@@ -937,15 +919,6 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                     cv2.setTrackbarPos("Monitor", window_name, current_monitor_idx)
 
             sub_flag, sub_str = JPEG_SUB_FLAG, JPEG_SUB_STR
-            priority_idx = max(0, min(len(PRIORITY_PRESETS) - 1, priority_idx))
-            priority_label, magic_threshold, quality_ceiling = PRIORITY_PRESETS[priority_idx]
-
-            if current_qual > quality_ceiling:
-                # Enforce the ceiling immediately — matters right after the
-                # user drags to a lower/FPS-favoring preset, so the change
-                # takes effect on the very next frame instead of drifting
-                # down one step at a time via the controller below.
-                current_qual = quality_ceiling
 
             try:
                 while True:
@@ -1048,19 +1021,16 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
             frame_byte_count = last_frame_bytes["bytes"]
 
             # ─────────────────────────────────────────────
-            #  AUTO QUALITY LOGIC (EMA SMOOTHED, ESCALATING) — always runs.
-            #  The Priority preset only changes magic_threshold /
-            #  quality_ceiling above; this loop always closes the
-            #  byte-budget control loop against whichever preset is active.
+            #  AUTO QUALITY LOGIC (EMA SMOOTHED, ESCALATING)
             # ─────────────────────────────────────────────
             if ema_avg_bytes is None:
                 ema_avg_bytes = frame_byte_count
             else:
                 ema_avg_bytes = (EMA_ALPHA * frame_byte_count) + ((1.0 - EMA_ALPHA) * ema_avg_bytes)
 
-            lower_bound = magic_threshold * 0.90
+            lower_bound = QUALITY_BYTE_THRESHOLD * 0.90
 
-            if frame_byte_count > magic_threshold:
+            if frame_byte_count > QUALITY_BYTE_THRESHOLD:
                 # Hard/instant drop: THIS frame actually blew the threshold —
                 # react now on the raw size, don't wait for the EMA to catch
                 # up (by the time it does, the ESP has already stalled on it
@@ -1091,8 +1061,8 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                         # Gentle climb back up once comfortably under
                         # threshold for a while, smoothed via EMA so
                         # quality doesn't flicker up and down.
-                        current_qual = min(quality_ceiling, current_qual + 1)
-                        if current_qual >= quality_ceiling:
+                        current_qual = min(MAX_QUALITY, current_qual + 1)
+                        if current_qual >= MAX_QUALITY:
                             under_threshold_streak = 0  # stop counting once at ceiling
                 else:
                     under_threshold_streak = 0
@@ -1108,7 +1078,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 overlay = np.empty_like(preview)
                 _draw_vertical_gradient(overlay, UI_BG_TOP, UI_BG_BOTTOM)
 
-                size_col = UI_ERR if frame_byte_count > magic_threshold else UI_OK
+                size_col = UI_ERR if frame_byte_count > QUALITY_BYTE_THRESHOLD else UI_OK
                 sram_str  = latest_esp_stats.get('SRAM',  '?/?')
                 psram_str = latest_esp_stats.get('PSRAM', '?/?')
 
@@ -1119,14 +1089,6 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 dw, _, _ = _text_size(disp_txt, 0.42, 1)
                 cv2.putText(overlay, disp_txt, (PREVIEW_W - dw - 10, 18), UI_FONT, 0.42, UI_ACCENT, 1, cv2.LINE_AA)
                 cv2.line(overlay, (10, header_h), (PREVIEW_W - 10, header_h), UI_CARD_EDGE, 1, cv2.LINE_AA)
-
-                # ── Metric grid ──
-                cols, rows = 4, 4
-                margin, gap = 10, 6
-                grid_top = header_h + 8
-                grid_bottom = PREVIEW_H - 16
-                cell_w = (PREVIEW_W - margin * 2 - gap * (cols - 1)) // cols
-                cell_h = (grid_bottom - grid_top - gap * (rows - 1)) // rows
 
                 metrics = [
                     ("FPS",   f"{latest_esp_stats.get('FPS', '-')}",              _diag_color(latest_esp_stats.get('FPS', '0'), 20, 15, True),
@@ -1146,14 +1108,20 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                     ("SRAM",  sram_str,                                          _mem_color(sram_str), None),
                     ("PSRAM", psram_str,                                        _mem_color(psram_str), None),
                     ("RAW",   f"{frame_byte_count}B",                            size_col,
-                     _pct_ratio(str(frame_byte_count), 0, magic_threshold)),
+                     _pct_ratio(str(frame_byte_count), 0, QUALITY_BYTE_THRESHOLD)),
                     ("AVG",   f"{int(ema_avg_bytes)}B",                          UI_ACCENT,
-                     _pct_ratio(str(int(ema_avg_bytes)), 0, magic_threshold)),
+                     _pct_ratio(str(int(ema_avg_bytes)), 0, QUALITY_BYTE_THRESHOLD)),
                     ("QUALITY", f"{current_qual}",                               (255, 255, 255),
                      _pct_ratio(str(current_qual), 0, 95)),
-                    ("PRIORITY", priority_label,
-                     UI_ACCENT, None),
                 ]
+
+                # Fit the cards to the metrics shown in this overlay.
+                cols, rows = 4, (len(metrics) + 3) // 4
+                margin, gap = 10, 6
+                grid_top = header_h + 8
+                grid_bottom = PREVIEW_H - 16
+                cell_w = (PREVIEW_W - margin * 2 - gap * (cols - 1)) // cols
+                cell_h = (grid_bottom - grid_top - gap * (rows - 1)) // rows
 
                 for i, (label, value, col, ratio) in enumerate(metrics):
                     r, c = divmod(i, cols)
@@ -1205,7 +1173,7 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                 ovf_col  = UI_OK if ovf_strk == 0 else (UI_WARN if ovf_strk < 3 else UI_ERR)
                 cool_frac = cool_strk / max(1, COOLDOWN_FRAMES)
                 cool_col = UI_LABEL_COL if cool_frac == 0 else (UI_OK if cool_frac >= 1.0 else UI_WARN)
-                size_col2 = UI_ERR if frame_byte_count > magic_threshold else UI_OK
+                size_col2 = UI_ERR if frame_byte_count > QUALITY_BYTE_THRESHOLD else UI_OK
 
                 pc2_metrics = [
                     ("ENC TIME",   f"{enc_us}us",                   enc_col,
@@ -1224,20 +1192,19 @@ def esp_instance_main(target_ip: str, claimed_monitors, instance_lock):
                     ("COOLDOWN",   f"{cool_strk}/{COOLDOWN_FRAMES}",cool_col,
                      cool_frac),
                     ("RAW",        f"{frame_byte_count}B",          size_col2,
-                     _pct_ratio(str(frame_byte_count), 0, magic_threshold)),
+                     _pct_ratio(str(frame_byte_count), 0, QUALITY_BYTE_THRESHOLD)),
                     ("AVG EMA",    f"{int(ema_avg_bytes or 0)}B",   UI_ACCENT,
-                     _pct_ratio(str(int(ema_avg_bytes or 0)), 0, magic_threshold)),
+                     _pct_ratio(str(int(ema_avg_bytes or 0)), 0, QUALITY_BYTE_THRESHOLD)),
                     ("QUALITY",    f"{current_qual}",               (255, 255, 255),
                      _pct_ratio(str(current_qual), 0, 95)),
                     ("Q FALLBACK", "YES" if last_frame_bytes["quality_fallback"] else "NO",
                      UI_WARN if last_frame_bytes["quality_fallback"] else UI_OK, None),
                     ("FRAME Q", f"{last_frame_bytes['frame_quality']}", UI_ACCENT,
                      _pct_ratio(str(last_frame_bytes["frame_quality"]), 0, 95)),
-                    ("PRIORITY",   priority_label,                  UI_ACCENT, None),
                     ("TARGET FPS", f"{BASE_FPS}",                   UI_LABEL_COL, None),
                 ]
 
-                cols, rows = 4, 4
+                cols, rows = 4, (len(pc2_metrics) + 3) // 4
                 margin, gap = 10, 6
                 grid_top    = header_h + 8
                 grid_bottom = PREVIEW_H - 16
