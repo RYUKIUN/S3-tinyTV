@@ -62,9 +62,7 @@ void wifiInit() {
     // in main.cpp's setup() right after WiFi.begin() — those were already
     // native esp_wifi_* calls, so they just move here unchanged.
     esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_max_tx_power(80);   // 0.25 dBm units -> requests 20 dBm;
-                                     // actual radiated power may be clamped
-                                     // lower by regional regulatory limits
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(WIFI_TX_POWER));
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20));
 }
