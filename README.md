@@ -352,4 +352,4 @@ This makes the project ideal for screen mirroring, remote displays, and interact
 
 ## License
 
-No license file is included in the repository at the time of this release. Add one before redistributing or reusing the code commercially. LovyanGFX and `esp_new_jpeg` are third-party components with their own licenses.
+Released under the [MIT License](LICENSE) — free to use, copy, modify and share. Third-party components and any assets that come with their own license files keep those licenses, which apply alongside this one.
