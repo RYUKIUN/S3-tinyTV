@@ -43,6 +43,9 @@
 #define WIFI_SSID  "Endmin"
 #define WIFI_PASS  "987654321"
 
+// Maximum WiFi transmit power in 0.25 dBm units (80 = 20 dBm requested).
+#define WIFI_TX_POWER  80
+
 // Hostname the ESP advertises on the network and uses for OTA discovery.
 #define OTA_HOSTNAME  "esp32s3-display"
 
