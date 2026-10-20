@@ -119,11 +119,13 @@ extern "C" void app_main(void) {
 
     lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
     lcd.setTextFont(2); lcd.setTextSize(1);
+    displayTuneBus();
 
     nvsInit();
 
 #if TOUCH_FEATURE_ENABLED
     touchBegin();
+    displayTuneBus();   // touch init re-inits the shared bus pads
 #endif
 
     drawBootHeader();
@@ -187,7 +189,7 @@ extern "C" void app_main(void) {
         bool ok = true;
         for (int s = 0; s < g_numDisplayBufs; s++) {
             frameFb[s] = (uint16_t*)heap_caps_aligned_alloc(
-                16, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
+                32, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);  // 32 = S3 D-cache line
             if (!frameFb[s]) { ok = false; break; }
         }
         if (ok) break;

@@ -53,7 +53,21 @@
 // with:  curl -X POST --data-binary @firmware.bin http://<device-ip>:3232/update
 #define OTA_HTTP_PORT  3232
 
-// ── Display wiring — ILI9341 over SPI ────────────────────────────────────
+// ── Display selection ────────────────────────────────────────────────────
+// Pick which physical display this firmware drives. Exactly one:
+//   DISPLAY_ILI9341_SPI  — 2.4"-2.8" ILI9341 module, SPI, optional XPT2046 touch
+//   DISPLAY_TFT24_I80    — 2.4" 240x320 TFT LCD *shield*, 8-bit parallel (i80),
+//                          NO touch (touch is force-disabled for this option)
+#define DISPLAY_ILI9341_SPI   1
+#define DISPLAY_TFT24_I80     2
+
+#define DISPLAY_SELECT        DISPLAY_ILI9341_SPI
+
+#if (DISPLAY_SELECT != DISPLAY_ILI9341_SPI) && (DISPLAY_SELECT != DISPLAY_TFT24_I80)
+#error "DISPLAY_SELECT must be DISPLAY_ILI9341_SPI or DISPLAY_TFT24_I80"
+#endif
+
+// ── Display wiring — ILI9341 over SPI (DISPLAY_ILI9341_SPI) ────────────────────────────────────
 // If your panel is wired to different pins, this is the only place you
 // need to change it — display.h reads these, nothing is hardcoded there.
 #define LCD_SPI_HOST    SPI2_HOST   // ESP32-S3 has SPI2_HOST / SPI3_HOST available
@@ -66,10 +80,18 @@
 // returning if you want to reclaim some of that margin once wiring is
 // solid (short leads, common ground, ideally soldered rather than
 // breadboarded).
-#define LCD_WRITE_HZ    75000000
+#define LCD_WRITE_HZ    80000000    // NOTE: GP-SPI on the S3 can only produce 80 or 40 MHz
+                                    // (80M PLL / integer divider). Anything between is
+                                    // silently snapped to one of them, so say what you mean.
+
+// LCD_DRIVE_CAP: pad drive strength for SCLK/MOSI, 0 (weakest ~5 mA) .. 3 (~40 mA).
+//   2 is the silicon default (no change). Lower values made the picture worse
+//   on the reference setup; 3 reduced glitches but made the backlight flicker
+//   (supply/ground noise), so it is a trade-off, not a fix.
+#define LCD_DRIVE_CAP   2
 
 #define LCD_PIN_SCLK    12
-#define LCD_PIN_MOSI    13
+#define LCD_PIN_MOSI    11
 #define LCD_PIN_MISO    -1          // the PANEL is write-only and never read.
                                     // The shared BUS does get a MISO line, but
                                     // it belongs to the touch controller — see
@@ -78,6 +100,39 @@
 #define LCD_PIN_CS      10          // chip select
 #define LCD_PIN_RST     5           // reset
 #define LCD_PIN_BUSY    -1          // -1 = not used by this panel
+
+// ── Display wiring — 2.4" TFT LCD shield over i80 / 8-bit parallel ───────
+// Used when DISPLAY_SELECT == DISPLAY_TFT24_I80. These are PLACEHOLDER pins —
+// change them to match your real wiring. Any free GPIO works (the S3 LCD_CAM
+// peripheral routes through the GPIO matrix). Avoid: GPIO0/3/45/46 (strapping),
+// GPIO19/20 (USB), GPIO26-37 (flash/PSRAM on N16R8 boards).
+// Shield signal names: LCD_D0..D7, LCD_WR, LCD_RD, LCD_RS (=DC), LCD_CS, LCD_RST.
+#define LCD_I80_PIN_D0   4
+#define LCD_I80_PIN_D1   5
+#define LCD_I80_PIN_D2   6
+#define LCD_I80_PIN_D3   7
+#define LCD_I80_PIN_D4   15
+#define LCD_I80_PIN_D5   16
+#define LCD_I80_PIN_D6   17
+#define LCD_I80_PIN_D7   18
+#define LCD_I80_PIN_WR   8      // write strobe
+#define LCD_I80_PIN_RD   12     // read strobe — held high by the driver (panel is write-only)
+#define LCD_I80_PIN_RS   9      // register select = data/command (DC)
+#define LCD_I80_PIN_CS   10     // chip select
+#define LCD_I80_PIN_RST  11     // reset (-1 if tied to the board reset)
+
+// i80 write clock. 20 MHz is a safe start for a shield on jumper wires;
+// the ILI9341 write cycle allows up to ~ 20-40 MHz depending on wiring.
+#define LCD_I80_WRITE_HZ 20000000
+
+// Pad drive strength for WR + D0..D7, 0 (weakest) .. 3 (strongest). 2 = default.
+#define LCD_I80_DRIVE_CAP 2
+
+#if DISPLAY_SELECT == DISPLAY_TFT24_I80
+  #define LCD_MODEL_NAME  "ILI9341 i80 320x240"
+#else
+  #define LCD_MODEL_NAME  "ILI9341  320x240"
+#endif
 
 // Panel's native resolution, before rotation. Most 2.4"-2.8" ILI9341
 // boards report portrait (240x320) natively and get rotated to landscape
@@ -110,8 +165,8 @@
 // so a configured-but-floating PENIRQ reads high and makes every single read
 // report "not touched" — touch would appear completely dead, not just less
 // efficient. Flipping this to 1 is the ONLY change needed once it's fixed.
-#define TOUCH_USE_IRQ   0
-#define TOUCH_PIN_MISO  11          // shared-bus MISO (display doesn't use it)
+#define TOUCH_USE_IRQ   1
+#define TOUCH_PIN_MISO  13          // shared-bus MISO (display doesn't use it)
 #define TOUCH_SPI_HZ    1000000     // XPT2046 max is ~2 MHz; 1 MHz is the safe default
 
 // BOOT button (GPIO0 on every ESP32-S3 devkit). Double-press it before the
@@ -119,7 +174,15 @@
 #define BOOT_PIN        0
 
 // Set to 0 to disable touch setup, calibration, sampling, and network events.
-#define TOUCH_FEATURE_ENABLED 1
+// This is only your *request*: the effective TOUCH_FEATURE_ENABLED below is
+// forced to 0 whenever the selected display has no touch panel (i80 shield).
+#define TOUCH_FEATURE_REQUESTED 1
+
+#if DISPLAY_SELECT == DISPLAY_TFT24_I80
+  #define TOUCH_FEATURE_ENABLED 0   // i80 shield has no touch — always off
+#else
+  #define TOUCH_FEATURE_ENABLED TOUCH_FEATURE_REQUESTED
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ZONE 2 — CHANGE THESE IF YOUR HARDWARE SETUP DIFFERS

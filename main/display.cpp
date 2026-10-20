@@ -1,6 +1,7 @@
 #include "display.h"
 #include "esp_task_wdt.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 
 LGFX lcd;
 
@@ -17,6 +18,24 @@ LGFX lcd;
 // can touch the bus, from any task, on either core.
 static inline void busLock()   { if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY); }
 static inline void busUnlock() { if (g_spiMutex) xSemaphoreGive(g_spiMutex); }
+
+// Drive strength is a pad (IO_MUX) property, so it survives whatever function
+// the pin is routed to — but LovyanGFX/the IDF driver may reconfigure pads
+// during init, so this is applied AFTER lcd.init() (and again after touchBegin()).
+void displayTuneBus() {
+#if DISPLAY_SELECT == DISPLAY_TFT24_I80
+    const int pins[] = { LCD_I80_PIN_WR,
+        LCD_I80_PIN_D0, LCD_I80_PIN_D1, LCD_I80_PIN_D2, LCD_I80_PIN_D3,
+        LCD_I80_PIN_D4, LCD_I80_PIN_D5, LCD_I80_PIN_D6, LCD_I80_PIN_D7 };
+    for (int p : pins)
+        if (p >= 0) gpio_set_drive_capability((gpio_num_t)p, (gpio_drive_cap_t)LCD_I80_DRIVE_CAP);
+    ESP_LOGI("display", "i80 8-bit %u Hz, drive cap %d", (unsigned)LCD_I80_WRITE_HZ, LCD_I80_DRIVE_CAP);
+#else
+    gpio_set_drive_capability((gpio_num_t)LCD_PIN_SCLK, (gpio_drive_cap_t)LCD_DRIVE_CAP);
+    gpio_set_drive_capability((gpio_num_t)LCD_PIN_MOSI, (gpio_drive_cap_t)LCD_DRIVE_CAP);
+    ESP_LOGI("display", "SPI %u Hz, drive cap %d", (unsigned)LCD_WRITE_HZ, LCD_DRIVE_CAP);
+#endif
+}
 
 void initDisplay() {
     lcd.init();
@@ -51,7 +70,7 @@ void drawBootHeader() {
     lcd.drawString("ESP32-S3 STREAM", 8, 6);
     lcd.setTextSize(1);
     lcd.setTextColor(0x7BEF, 0x1082);
-    lcd.drawString("ILI9341  320x240  ping-pong", 8, 34);
+    lcd.drawString(LCD_MODEL_NAME "  ping-pong", 8, 34);
     lcd.drawFastHLine(0, 54, SCREEN_W, TFT_DARKGREY);
     lcd.endWrite();
     busUnlock();

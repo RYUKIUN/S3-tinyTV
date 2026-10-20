@@ -3,6 +3,7 @@
 #include "esp_jpeg_dec.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_cache.h"
 
 static const char* TAG = "jpeg";
 static jpeg_dec_handle_t s_jpegDec = nullptr;
@@ -85,6 +86,21 @@ bool decodeJpegFrame(const DecodeMsg& msg, uint8_t framebufferIdx,
 
         memcpy(frameOut + outputOffset, s_blockOut, (size_t)io.out_size);
         outputOffset += (size_t)io.out_size;
+    }
+
+    // The memcpy above went through the S3's write-back data cache into PSRAM,
+    // but the display DMA reads PSRAM directly and does NOT see dirty cache
+    // lines. Without this, the newest rows of a frame can still be sitting in
+    // the cache when the DMA starts, so it sends stale data from an older
+    // frame -> torn/split picture whose position changes every frame. The
+    // faster the SPI clock, the sooner the DMA reaches those rows, which is
+    // why 80 MHz showed it far more than 40 MHz.
+    // Address and size are 32-byte aligned (frameFb is 32-aligned, 153600 B).
+    esp_err_t ce = esp_cache_msync(frameOut, frameBytes,
+                                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    if (ce != ESP_OK) {
+        static bool warned = false;
+        if (!warned) { warned = true; ESP_LOGW(TAG, "cache writeback failed: %s", esp_err_to_name(ce)); }
     }
 
     decodeUs = decodeTotalUs;
