@@ -80,7 +80,7 @@
 // returning if you want to reclaim some of that margin once wiring is
 // solid (short leads, common ground, ideally soldered rather than
 // breadboarded).
-#define LCD_WRITE_HZ    80000000    // NOTE: GP-SPI on the S3 can only produce 80 or 40 MHz
+#define LCD_WRITE_HZ    75000000    // NOTE: GP-SPI on the S3 can only produce 80 or 40 MHz
                                     // (80M PLL / integer divider). Anything between is
                                     // silently snapped to one of them, so say what you mean.
 
