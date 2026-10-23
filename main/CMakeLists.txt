@@ -23,6 +23,9 @@ idf_component_register(
         esp_psram
         esp_driver_tsens
         driver
+        esp_driver_spi
+        esp_driver_gpio
+        esp_lcd
         esp_http_server
         app_update
         esp_hw_support
@@ -32,6 +35,7 @@ idf_component_register(
         # Managed/vendored components pulled in by main/idf_component.yml —
         # the names below MUST match the dependency keys in that file.
         lovyangfx
+        esp_lcd_ili9341
         esp_new_jpeg
 )
 

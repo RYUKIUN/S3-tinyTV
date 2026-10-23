@@ -4,7 +4,7 @@
 
 // Loads calibration from NVS and, if none is stored (or the BOOT button was
 // double-pressed), runs the interactive grid calibration on screen.
-// Call from app_main() AFTER lcd.init() but BEFORE WiFi — the boot screen is
+// Call from app_main() AFTER initDisplay() but BEFORE WiFi — the boot screen is
 // already up at that point, and calibration is a one-time, blocking, purely
 // local affair that has no business competing with the stream.
 #if TOUCH_FEATURE_ENABLED

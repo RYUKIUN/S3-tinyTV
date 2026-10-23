@@ -80,7 +80,7 @@
 // returning if you want to reclaim some of that margin once wiring is
 // solid (short leads, common ground, ideally soldered rather than
 // breadboarded).
-#define LCD_WRITE_HZ    75000000    // NOTE: GP-SPI on the S3 can only produce 80 or 40 MHz
+#define LCD_WRITE_HZ    80000000    // NOTE: GP-SPI on the S3 can only produce 80 or 40 MHz
                                     // (80M PLL / integer divider). Anything between is
                                     // silently snapped to one of them, so say what you mean.
 
@@ -136,20 +136,39 @@
 
 // Panel's native resolution, before rotation. Most 2.4"-2.8" ILI9341
 // boards report portrait (240x320) natively and get rotated to landscape
-// in software — see `lcd.setRotation()` in display.cpp if you need to
-// change orientation.
+// in the panel (MADCTL) — see LCD_MADCTL below if you need to change
+// orientation. The software canvas is always 320x240 landscape.
 #define LCD_PANEL_W     240
 #define LCD_PANEL_H     320
 
+// ── esp_lcd transfer settings ────────────────────────────────────────────────
+// A frame goes out as strips of LCD_STRIP_ROWS rows, queued back-to-back
+// (RAMWR then RAMWRC). Each strip is one queued SPI/i80 transaction, so the
+// queue depth must be >= ceil(SCREEN_H / LCD_STRIP_ROWS) = 15.
+#define LCD_STRIP_ROWS     16
+#define LCD_TRANS_QUEUE    16
+// Buffers handed to the DMA engine from PSRAM are aligned to this. 64 covers
+// both 32 B and 64 B data-cache lines; sizes used here are multiples of it.
+#define LCD_FB_ALIGN       64
+// ILI9341 MADCTL (0x36) for landscape 320x240: MV (0x20) + BGR (0x08) = 0x28.
+// 0xE8 (MX|MY|MV|BGR) is the same picture rotated 180 degrees, so to flip the
+// orientation toggle BOTH 0x80 and 0x40. A single one of them mirrors the
+// image. If red and blue are swapped toggle 0x08.
+// NOTE: changing this changes where a touch lands, so bump TOUCH_CAL_VERSION
+// (touch.cpp) to force a recalibration.
+#define LCD_MADCTL         0x28
+// Give up waiting for a frame's DMA after this long (pathological case only).
+#define DISPLAY_DMA_TIMEOUT_MS 1000
+
 // ── Touch wiring — XPT2046 on the SAME SPI bus as the display ────────────
 // The touch controller shares SCLK/MOSI with the panel and has its own CS.
-// This is deliberate: LovyanGFX's bus lock already serialises access, and a
-// touch read is 57 bytes at 1 MHz (~456 us) against the display's 150 KB
+// This is deliberate: g_spiMutex serialises access, and a touch read is a
+// few short transfers at 1 MHz (well under 1 ms) against the display's 150 KB
 // DMA pushes — sharing costs far less than burning a second SPI host.
 //
 // MISO matters here. The panel is write-only (LCD_PIN_MISO = -1), but the
 // XPT2046 has to be *read*, so the shared bus needs a MISO line after all.
-// LovyanGFX's touch init adds it to the host; the panel simply never uses it.
+// initDisplay() puts it on the host (spi_bus_initialize); the panel never uses it.
 #define TOUCH_PIN_CS    9
 #define TOUCH_PIN_IRQ   8           // PENIRQ — low while the panel is pressed
 
@@ -160,14 +179,16 @@
 //     on the interrupt, which costs literally nothing while untouched.
 //
 // This MUST be 0 while the line is unwired. It is not merely an
-// optimisation flag: Touch_XPT2046::getTouchRaw() opens with
-//     if (_cfg.pin_int >= 0 && gpio_in(_cfg.pin_int)) return 0;
-// so a configured-but-floating PENIRQ reads high and makes every single read
-// report "not touched" — touch would appear completely dead, not just less
-// efficient. Flipping this to 1 is the ONLY change needed once it's fixed.
+// optimisation flag: xptReadRaw() (touch.cpp) returns "not touched" whenever
+// the PENIRQ pin reads high, so a configured-but-floating PENIRQ would make
+// every single read report "not touched" — touch would appear completely
+// dead, not just less efficient. Flipping this to 1 is the ONLY change needed once it's fixed.
 #define TOUCH_USE_IRQ   1
 #define TOUCH_PIN_MISO  13          // shared-bus MISO (display doesn't use it)
 #define TOUCH_SPI_HZ    1000000     // XPT2046 max is ~2 MHz; 1 MHz is the safe default
+// XPT2046 pressure gate: z = Z1 + 4095 - Z2. Readings below this count as "not
+// touched". Raise it if you get ghost touches, lower it if light taps are missed.
+#define TOUCH_PRESSURE_MIN 200
 
 // BOOT button (GPIO0 on every ESP32-S3 devkit). Double-press it before the
 // stream starts to force a touch recalibration — see touch.cpp.
@@ -201,11 +222,14 @@
 #define MAX_FRAME_CHUNKS ((MAX_JPEG_FRAME + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE)
 
 // ── Pipeline depth (memory budget) ────────────────────────────────────────
-// JPEG frame buffers prefer internal SRAM for the first two slots, with
-// PSRAM fallback; remaining slots use PSRAM. Decoder block scratch stays in SRAM.
-// More JPEG slots absorb network/decode jitter at a cost of up to 35 KiB each.
-#define CFG_NUM_JPEG_SLOTS    3   // desired full-frame JPEG buffers (1–6)
-#define CFG_NUM_DISPLAY_BUFS  3   // desired display bufs (2–6)
+// Pipeline depth — deliberately minimal (low latency, small RAM footprint):
+//   * 2 JPEG slots: slot 0 in internal SRAM, slot 1 in PSRAM (see app_main).
+//   * 2 display framebuffers (PSRAM): exactly one ping-pong pair — one is being
+//     sent to the panel while the decoder fills the other.
+// Fewer slots = less buffered (stale) video and less RAM, but also less slack
+// to absorb network/decode jitter: any hiccup now shows up as a dropped frame.
+#define CFG_NUM_JPEG_SLOTS    2   // desired full-frame JPEG buffers (1–6)
+#define CFG_NUM_DISPLAY_BUFS  2   // desired display bufs (2–6)
 
 // Hard array caps — do NOT exceed. These size the actual arrays; the
 // CFG_ values above are the *desired* runtime count within that cap.
@@ -358,20 +382,14 @@ extern bool  g_remoteAddrValid;
 extern float stat_jitter;
 
 // ── Shared SPI bus arbitration ───────────────────────────────────────────────
-// The display and the touch controller sit on the same SPI host, but the
-// display's transfer is an ASYNC DMA push: pushPixelsDMA() returns while bytes
-// are still going out, and displayTask keeps its startWrite() open across
-// several loop iterations until dmaBusy() clears. LovyanGFX's own bus lock does
-// not cover that window, and Panel_Device::getTouchRaw() would happily call
-// endTransaction() mid-DMA from another task — tearing the frame and desyncing
-// displayTask's startWrite/endWrite pairing.
-//
-// So bus ownership is arbitrated explicitly: displayTask holds this mutex for
-// the ENTIRE push (startWrite -> DMA -> waitDMA -> endWrite), and touchTask
-// takes it around its read. It's a real mutex, not a binary semaphore, so
-// priority inheritance applies: if the display wants the bus while touch holds
-// it, touch is boosted and hands it back within one 456 us read. That's the
-// hard upper bound on how much touch can ever delay a frame.
+// The display (esp_lcd panel IO) and the XPT2046 touch controller are two
+// devices on the same SPI host. A frame is sent as a chain of queued DMA strips
+// that completes asynchronously (see display.cpp), so displayTask holds this
+// mutex from the first strip being queued until the last-strip completion
+// callback has fired. touchTask takes it around each read; so does every UI
+// push. It is a real mutex (priority inheritance): if the display wants the
+// bus while touch holds it, touch is boosted and hands it back within one
+// bounded read. FreeRTOS requires the SAME task to take and give it.
 extern SemaphoreHandle_t g_spiMutex;
 
 // ── Touch pipeline ───────────────────────────────────────────────────────────

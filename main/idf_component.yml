@@ -17,7 +17,11 @@ dependencies:
   # straight from Espressif's official component registry.
   espressif/esp_new_jpeg: "^1.0.2"
 
-  # Display + touch driver. Not on the component registry, so it's pulled
+  # Official ILI9341 panel driver for esp_lcd (init sequence, reset, DISPON).
+  espressif/esp_lcd_ili9341: ">=1.0.0"
+
+  # Software text/graphics renderer only (bus-less sprite) — the panel itself
+  # is driven by esp_lcd now. Originally the display + touch driver. Not on the component registry, so it's pulled
   # as a git dependency instead — same library, same API, just fetched
   # straight from upstream instead of vendored into this zip.
   # Pin to a release compatible with ESP-IDF 6.1's GCC 15 / C23 toolchain.

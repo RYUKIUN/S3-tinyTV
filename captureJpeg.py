@@ -41,7 +41,7 @@ PREVIEW_W, PREVIEW_H = 480, 360
 
 # Send rate is fixed — not user-adjustable — so the pipeline behaves the
 # same way every time instead of being a variable someone has to tune.
-BASE_FPS = 45
+BASE_FPS = 40
 
 # When the (post-processing) frame is bit-for-bit identical to the last one
 # we sent, nothing is encoded or transmitted. To keep the ESP's stream alive

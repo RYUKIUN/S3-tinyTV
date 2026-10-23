@@ -117,15 +117,17 @@ extern "C" void app_main(void) {
     touchQueue = xQueueCreate(TOUCH_EVENT_QUEUE_LEN, sizeof(TouchEvent));
 #endif
 
-    lcd.init(); lcd.setRotation(3); lcd.setColorDepth(16);
-    lcd.setTextFont(2); lcd.setTextSize(1);
+    if (!initDisplay()) {
+        printf("[ERROR] esp_lcd display init failed — halting\n");
+        while (1) delay(1000);
+    }
     displayTuneBus();
 
     nvsInit();
 
 #if TOUCH_FEATURE_ENABLED
     touchBegin();
-    displayTuneBus();   // touch init re-inits the shared bus pads
+    displayTuneBus();   // harmless re-apply after the touch device joins the bus
 #endif
 
     drawBootHeader();
@@ -145,7 +147,7 @@ extern "C" void app_main(void) {
         while (1) delay(1000);
     }
 
-    // ── Full-frame JPEG slots: use SRAM for two hot-path buffers, then PSRAM.
+    // ── Full-frame JPEG slots: slot 0 in SRAM (hot path), slot 1 in PSRAM.
     g_numJpegSlots = CFG_NUM_JPEG_SLOTS;
     while (g_numJpegSlots >= 1) {
         for (int s = 0; s < MM_MAX_JPEG_SLOTS; s++) {
@@ -156,12 +158,12 @@ extern "C" void app_main(void) {
         }
         bool ok = true;
         for (int s = 0; s < g_numJpegSlots; s++) {
-            uint32_t caps = s < 2
+            uint32_t caps = s == 0
                 ? MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
                 : MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
             jpegFrames[s].data = (uint8_t*)heap_caps_aligned_alloc(
                 16, MAX_JPEG_FRAME, caps);
-            if (jpegFrames[s].data == nullptr && s < 2) {
+            if (jpegFrames[s].data == nullptr && s == 0) {
                 jpegFrames[s].data = (uint8_t*)heap_caps_aligned_alloc(
                     16, MAX_JPEG_FRAME, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             }
@@ -177,7 +179,7 @@ extern "C" void app_main(void) {
         statusLine(2, "Buffers:", "JPEG ALLOC FAILED!", TFT_RED);
         while (1) delay(1000);
     }
-    printf("[MEM] Full-frame JPEG buffers: %d / %d (up to %u bytes each, first 2 prefer SRAM, CFG=%d)\n",
+    printf("[MEM] Full-frame JPEG buffers: %d / %d (up to %u bytes each, slot 0 prefers SRAM, others PSRAM, CFG=%d)\n",
            g_numJpegSlots, MM_MAX_JPEG_SLOTS, (unsigned)MAX_JPEG_FRAME, CFG_NUM_JPEG_SLOTS);
 
     // ── Display framebuffers (PSRAM) — fallback from CFG down to 2 ───────────
@@ -189,7 +191,7 @@ extern "C" void app_main(void) {
         bool ok = true;
         for (int s = 0; s < g_numDisplayBufs; s++) {
             frameFb[s] = (uint16_t*)heap_caps_aligned_alloc(
-                32, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);  // 32 = S3 D-cache line
+                LCD_FB_ALIGN, SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);  // DMA-from-PSRAM alignment
             if (!frameFb[s]) { ok = false; break; }
         }
         if (ok) break;

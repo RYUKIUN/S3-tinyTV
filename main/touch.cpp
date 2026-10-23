@@ -14,12 +14,13 @@
 #include "display.h"
 #include "nvs.h"
 #include "driver/gpio.h"
+#include "driver/spi_master.h"
 #include "esp_log.h"
 
 static const char* TAG = "touch";
 
 #define TOUCH_CAL_MAGIC   0x9341
-#define TOUCH_CAL_VERSION 2
+#define TOUCH_CAL_VERSION 4   // v3: raw ADC counts; v4: display orientation changed (MADCTL 0xE8 -> 0x28)
 
 #define TOUCH_CAL_TERMS   4   // 1, u, v, u*v
 #define TOUCH_CAL_NPOINTS (TOUCH_CAL_GRID * TOUCH_CAL_GRID)
@@ -156,6 +157,72 @@ static bool solveLinear(double A[TOUCH_CAL_TERMS][TOUCH_CAL_TERMS],
     return true;
 }
 
+// ─────────────────────────────────────────────
+//  XPT2046 driver  [esp_lcd migration]
+// ─────────────────────────────────────────────
+// LovyanGFX no longer owns the SPI bus (esp_lcd does), so the touch controller
+// is a plain second device on the same host. Raw values are real 12-bit ADC
+// counts, which is what calBasis() (÷4096) always assumed.
+//
+// Control bytes use PD1:PD0 = 00 (power down between conversions) on purpose:
+// that keeps PENIRQ functional while idle. 12-bit, differential mode.
+static spi_device_handle_t s_xpt = nullptr;
+
+static bool xptInit() {
+    spi_device_interface_config_t dc = {};
+    dc.clock_speed_hz = TOUCH_SPI_HZ;
+    dc.mode           = 0;
+    dc.spics_io_num   = TOUCH_PIN_CS;
+    dc.queue_size     = 1;
+    esp_err_t e = spi_bus_add_device(LCD_SPI_HOST, &dc, &s_xpt);
+    if (e != ESP_OK) ESP_LOGE(TAG, "XPT2046 add_device failed: %s", esp_err_to_name(e));
+    return e == ESP_OK;
+}
+
+// One conversion: send the control byte, read the 12-bit result that follows
+// the busy bit.
+static int xptXfer(uint8_t cmd) {
+    spi_transaction_t t = {};
+    t.length = 24;
+    t.flags  = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.tx_data[0] = cmd;
+    if (spi_device_polling_transmit(s_xpt, &t) != ESP_OK) return -1;
+    return (int)((((uint16_t)t.rx_data[1] << 8) | t.rx_data[2]) >> 3) & 0x0FFF;
+}
+
+static int median3(int a, int b, int c) {
+    if (a > b) { int t = a; a = b; b = t; }
+    if (b > c) { b = c; }
+    return a > b ? a : b;
+}
+
+// No locking here: callers hold g_spiMutex (or run single-threaded at boot).
+static bool xptReadRaw(int32_t* x, int32_t* y) {
+    if (!s_xpt) return false;
+#if TOUCH_USE_IRQ
+    if (gpio_get_level((gpio_num_t)TOUCH_PIN_IRQ)) return false;   // PENIRQ high = untouched
+#endif
+    int z1 = xptXfer(0xB0), z2 = xptXfer(0xC0);
+    if (z1 < 0 || z2 < 0) return false;
+    if (z1 + 4095 - z2 < TOUCH_PRESSURE_MIN) return false;
+
+    xptXfer(0xD0);                       // throw-away: let the ADC settle on X
+    int xs[3], ys[3];
+    for (int i = 0; i < 3; i++) { xs[i] = xptXfer(0xD0); ys[i] = xptXfer(0x90); }
+    if (xs[0] < 0 || xs[1] < 0 || xs[2] < 0 || ys[0] < 0 || ys[1] < 0 || ys[2] < 0) return false;
+    *x = median3(xs[0], xs[1], xs[2]);
+    *y = median3(ys[0], ys[1], ys[2]);
+    return true;
+}
+
+// For boot-time/calibration code that does not already hold the bus mutex.
+static bool xptReadRawLocked(int32_t* x, int32_t* y) {
+    if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+    bool t = xptReadRaw(x, y);
+    if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+    return t;
+}
+
 static void sampleTarget(int tx, int ty, int idx1, int total,
                          int32_t& outX, int32_t& outY) {
     const int R = 9;
@@ -173,6 +240,7 @@ static void sampleTarget(int tx, int ty, int idx1, int total,
     lcd.drawFastHLine(tx - R, ty, R * 2 + 1, TFT_WHITE);
     lcd.drawFastVLine(tx, ty - R, R * 2 + 1, TFT_WHITE);
     lcd.drawCircle(tx, ty, R, TFT_RED);
+    displayFlush();
 
     int32_t xs[TOUCH_CAL_SAMPLES], ys[TOUCH_CAL_SAMPLES];
     int  got  = 0;
@@ -180,7 +248,7 @@ static void sampleTarget(int tx, int ty, int idx1, int total,
 
     while (got < TOUCH_CAL_SAMPLES) {
         int32_t rx, ry;
-        if (lcd.getTouchRaw(&rx, &ry)) {
+        if (xptReadRawLocked(&rx, &ry)) {
             if (!seen) {
                 seen = true;
                 delay(60);
@@ -209,9 +277,10 @@ static void sampleTarget(int tx, int ty, int idx1, int total,
     outY = ys[got / 2];
 
     lcd.drawCircle(tx, ty, R, TFT_GREEN);
+    displayFlush();
 
     int32_t dx, dy;
-    while (lcd.getTouchRaw(&dx, &dy)) delay(10);
+    while (xptReadRawLocked(&dx, &dy)) delay(10);
     delay(120);
 }
 
@@ -286,6 +355,7 @@ static void runCalibration() {
         lcd.drawString(msg, 8, 100);
     }
     lcd.drawString("Tap each marker centre precisely.", 8, 120);
+    displayFlush();
     delay(2000);
 
     float rms = 9999.0f;
@@ -301,6 +371,7 @@ static void runCalibration() {
             char msg[44];
             snprintf(msg, sizeof(msg), "error %.1f px, want under %.0f", rms, TOUCH_CAL_MAX_RMS);
             lcd.drawString(msg, 8, 110);
+            displayFlush();
             delay(2200);
         }
     }
@@ -322,11 +393,14 @@ static void runCalibration() {
         snprintf(msg, sizeof(msg), "accuracy: %.1f px RMS", rms);
         lcd.drawString(msg, 8, 112);
     }
+    displayFlush();
 
     delay(1400);
 }
 
 void touchBegin() {
+    xptInit();   // second device on the display's SPI host (bus created by initDisplay())
+
     // [REBASE: driver/gpio.h replaces pinMode/attachInterrupt/FALLING/
     // INPUT_PULLUP/digitalPinToInterrupt. gpio_install_isr_service() is the
     // ESP-IDF equivalent of Arduino's implicit "interrupts just work" setup —
@@ -371,7 +445,7 @@ static bool readPoint(int32_t& x, int32_t& y, bool& gotBus) {
     gotBus = (xSemaphoreTake(g_spiMutex, pdMS_TO_TICKS(TOUCH_BUS_WAIT_MS)) == pdTRUE);
     if (!gotBus) return false;
     int32_t rx, ry;
-    bool touched = lcd.getTouchRaw(&rx, &ry);
+    bool touched = xptReadRaw(&rx, &ry);
     xSemaphoreGive(g_spiMutex);
     if (touched) calApply(rx, ry, x, y);
     return touched;
@@ -405,9 +479,9 @@ void touchTask(void*) {
                 gpio_isr_handler_remove((gpio_num_t)TOUCH_PIN_IRQ);
                 s_irqAttached = false;
 #endif
-                xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+                displayUiLock();      // keep statusLine() etc. off the canvas meanwhile
                 runCalibration();
-                xSemaphoreGive(g_spiMutex);
+                displayUiUnlock();
                 ESP_LOGI(TAG, "Recalibrated via BOOT double-press");
                 continue;
             }
